@@ -1,6 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.43.2";
 
-// Hardware-constrained system signature for logging environment context
+// Build trigger revision: 1.0.1
 const SYSTEM_MEMORY = {
   hardware_constraints: { host_device: "Samsung Galaxy M15" },
 };
@@ -9,7 +9,7 @@ const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
 if (!supabaseUrl || !supabaseServiceKey) {
-  throw new Error("CRITICAL CONFIGURATION ERROR: Environment variables are unmapped inside the runner execution context.");
+  throw new Error("CRITICAL CONFIGURATION ERROR: Environment variables are unmapped.");
 }
 
 // Instantiate the Supabase client pinned strictly to your isolated telemetry schema layer
@@ -49,7 +49,7 @@ Deno.serve(async (req: Request) => {
           source_agent_id: source_agent_id ?? "unknown-agent",
           skill_id,
           status,
-          // Merges incoming JSON logs with your sovereign system metadata signature
+          // Merges incoming JSON logs with your system metadata signature
           event_data: { 
             ...(event_data ?? {}), 
             device_host: SYSTEM_MEMORY.hardware_constraints.host_device 
@@ -74,4 +74,3 @@ Deno.serve(async (req: Request) => {
     );
   }
 });
-
