@@ -1,300 +1,40 @@
-# EDGE-001 Security Hardening — Diagnostic & Fix Guide
-**Kriptomech | KZDI Technologies Ltd**
-**Date:** May 27, 2026 | **Status:** ACTIVE TROUBLESHOOTING
-
----
-
-## PART A: GitHub Actions CI/CD Failure (`security-migrations.yml`)
-
-### Problem Summary
-- **Workflow:** `security-migrations.yml`
-- **Repo:** `kzdi-platform`
-- **Error:** ENOTFOUND / auth failure on Supabase session pooler connection
-- **Session Pooler Details:**
-  - Host: `aws-0-eu-west-1.pooler.supabase.com`
-  - Port: `5432` (PostgreSQL)
-  - User: `postgres.qpoooqpcjmbwkzjeyczxs`
-  - Database: `postgres`
-
-### Root Cause Analysis
-
-#### 1. **GitHub Secret Mismatch** (Most Likely)
-The `SUPABASE_DB_PASSWORD` secret stored in GitHub does **not match** the actual Supabase database password. This causes:
-- Authentication failure at connection time
-- ENOTFOUND if DNS resolution works but auth fails
-- Immediate connection drop
-
-#### 2. **Session Pooler Configuration Issues**
-- Incorrect connection string format
-- Missing connection parameters
-- Pooler timeout settings too aggressive
-
-#### 3. **PostgreSQL Client Not Installed**
-The workflow may hang on `apt-get install postgresql-client` if:
-- Package manager cache is stale
-- Network timeout during install
-- Missing `update` step
-
----
-
-## ✅ FIX #1: Verify & Update GitHub Secret
-
-### Step 1a: Get Current Supabase DB Password
-1. Go to **Supabase Dashboard** → Your Project
-2. Navigate to **Settings** → **Database**
-3. Scroll to **Connection String** section
-4. Copy the password from the connection string OR reset it if needed
-5. **Important:** The password field shows masked characters — click **"Reveal"** if available
-
-### Step 1b: Update GitHub Secret
-1. Go to GitHub repo → **Settings** → **Secrets and variables** → **Actions**
-2. Find `SUPABASE_DB_PASSWORD` (or create if missing)
-3. **Delete the old secret** and create a new one with the correct password
-4. Paste the **exact** password (no spaces, special chars as-is)
-
-### Step 1c: Test Connection String Format
-Your connection string should look like:
-```
-postgresql://postgres.qpoooqpcjmbwkzjeyczxs:<PASSWORD>@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require
-```
-
-**Never store the full connection string in GitHub Secrets.** Instead:
-- Store only `SUPABASE_DB_PASSWORD` as a secret
-- Store host, user, port, database as non-secret GitHub Variables (or hardcode in workflow)
-
----
-
-## ✅ FIX #2: Update `security-migrations.yml` Workflow
-
-### Problem: PostgreSQL Client Installation Hangs
-**Fix:** Add explicit package manager cache update and timeout handling
-
-```yaml
 name: security-migrations
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
+  workflow_dispatch:
 
 jobs:
-  postgres-migration:
+  postgres-security-migration:
     runs-on: ubuntu-latest
-    
     steps:
       - uses: actions/checkout@v4
-      
-      # FIX: Update package manager cache FIRST
-      - name: Update package manager
+
+      - name: Install PostgreSQL client
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y postgresql-client
         timeout-minutes: 10
-      
-      # FIX: Build connection string dynamically
-      - name: Set up Supabase connection
+
+      - name: Test connection
+        env:
+          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
         run: |
-          PGPASSWORD=${{ secrets.SUPABASE_DB_PASSWORD }} \
           psql -h aws-0-eu-west-1.pooler.supabase.com \
                -p 5432 \
                -U postgres.qpoooqpcjmbwkzjeyczxs \
                -d postgres \
                -c "SELECT version();"
+        timeout-minutes: 5
+
+      - name: Run security migrations
         env:
           PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
-        timeout-minutes: 5
-      
-      # FIX: Run migrations with explicit error handling
-      - name: Run security migrations
         run: |
-          PGPASSWORD=${{ secrets.SUPABASE_DB_PASSWORD }} \
           psql -h aws-0-eu-west-1.pooler.supabase.com \
                -p 5432 \
                -U postgres.qpoooqpcjmbwkzjeyczxs \
                -d postgres \
                -f ./migrations/security-migrations.sql
-        env:
-          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
         timeout-minutes: 5
-      
-      # FIX: Add workflow summary on success/failure
-      - name: Workflow summary
-        if: always()
-        run: echo "Migration workflow completed with status: ${{ job.status }}"
-```
-
-### Why This Works
-- **`sudo apt-get update`** refreshes package cache before install
-- **`timeout-minutes`** prevents indefinite hangs
-- **`PGPASSWORD` env var** passes password securely
-- **`psql` test command** validates connection before running migrations
-- **Explicit error handling** surfaces failures clearly
-
----
-
-## PART B: Telemetry Function 500 Error
-
-### Problem Summary
-- **Table:** `telemetry.telemetry_events`
-- **Error:** INSERT operation failing with 500 error
-- **Root Cause:** RLS policy or permission issue, OR table schema mismatch
-
-### ✅ FIX #3: Verify RLS Policy & Service Role Permissions
-
-```sql
--- Step 1: Check if RLS is enabled on telemetry_events
-SELECT schemaname, tablename, rowsecurity
-FROM pg_tables
-WHERE schemaname = 'telemetry' AND tablename = 'telemetry_events';
-
--- Expected output: rowsecurity = true
-
--- Step 2: List all RLS policies on the table
-SELECT schemaname, tablename, policyname, permissive, roles, qual, with_check
-FROM pg_policies
-WHERE schemaname = 'telemetry' AND tablename = 'telemetry_events';
-
--- Expected output: At least one INSERT policy with role 'service_role'
-
--- Step 3: Check service_role permissions
-SELECT grantee, privilege_type
-FROM role_table_grants
-WHERE table_name = 'telemetry_events' AND table_schema = 'telemetry';
-
--- Expected output: service_role has INSERT, UPDATE, SELECT, DELETE
-
--- Step 4: Verify the policy explicitly allows INSERT
-SELECT * FROM pg_policies
-WHERE schemaname = 'telemetry'
-  AND tablename = 'telemetry_events'
-  AND policyname = 'Enable insert for service_role';
-```
-
-### ✅ FIX #4: Recreate RLS Policy if Needed
-
-If the policy is missing or malformed, run:
-
-```sql
--- Drop old policy if it exists (CAREFUL!)
-DROP POLICY IF EXISTS "Enable insert for service_role" 
-  ON telemetry.telemetry_events;
-
--- Create new policy allowing service_role to INSERT
-CREATE POLICY "Enable insert for service_role"
-  ON telemetry.telemetry_events
-  FOR INSERT
-  WITH CHECK (true)
-  TO service_role;
-
--- Grant explicit permissions
-GRANT USAGE ON SCHEMA telemetry TO service_role;
-GRANT INSERT, UPDATE, SELECT, DELETE ON telemetry.telemetry_events TO service_role;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA telemetry TO service_role;
-```
-
----
-
-## ✅ FIX #5: Verify Table Schema & Column Types
-
-```sql
--- Check table structure
-SELECT column_name, data_type, is_nullable
-FROM information_schema.columns
-WHERE table_schema = 'telemetry' AND table_name = 'telemetry_events'
-ORDER BY ordinal_position;
-
--- Verify primary key and constraints
-SELECT constraint_name, constraint_type
-FROM information_schema.table_constraints
-WHERE table_schema = 'telemetry' AND table_name = 'telemetry_events';
-```
-
-**Common Causes of INSERT 500 Error:**
-1. Missing DEFAULT for `id` column (if serial/auto-increment)
-2. NOT NULL constraint on a column you're not providing
-3. Foreign key constraint violation
-4. Trigger error (check trigger logs)
-5. RLS policy denying INSERT for service_role
-
----
-
-## ✅ FIX #6: Test Telemetry INSERT Directly
-
-### As Service Role (in Supabase SQL Editor):
-```sql
--- Set session to service_role
-SET ROLE service_role;
-
--- Attempt direct INSERT
-INSERT INTO telemetry.telemetry_events (
-  event_name,
-  event_status,
-  event_priority,
-  event_message,
-  created_at
-) VALUES (
-  'test_event',
-  'success',
-  'low',
-  'Testing telemetry insert',
-  NOW()
-)
-RETURNING *;
-
--- Check if insert succeeded
-SELECT COUNT(*) FROM telemetry.telemetry_events;
-```
-
-If this fails, the issue is **not** with your CI/CD, but with the table/policy setup.
-
----
-
-## ✅ QUICK CHECKLIST
-
-### GitHub Actions Fix
-- [ ] Update package manager cache in workflow
-- [ ] Verify `SUPABASE_DB_PASSWORD` secret matches Supabase console
-- [ ] Test connection string manually: `psql -h aws-0-eu-west-1.pooler.supabase.com -U postgres.qpoooqpcjmbwkzjeyczxs -d postgres`
-- [ ] Re-run workflow after secret update
-- [ ] Check workflow logs for `SELECT version()` success
-
-### Telemetry Function Fix
-- [ ] Run diagnostic SQL queries (FIX #3)
-- [ ] Verify service_role has INSERT permission
-- [ ] Check RLS policy is not blocking service_role
-- [ ] Test INSERT directly as service_role
-- [ ] Review trigger logic if any exist
-- [ ] Check Supabase function logs for detailed error
-
----
-
-## 🚨 CRITICAL: Workflow Secrets Best Practice
-
-**NEVER** store passwords directly in workflow files. Instead:
-
-```yaml
-# ✅ CORRECT
-env:
-  DB_HOST: aws-0-eu-west-1.pooler.supabase.com
-  DB_USER: postgres.qpoooqpcjmbwkzjeyczxs
-  PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
-
-# ❌ WRONG
-env:
-  DATABASE_URL: "postgresql://user:password@host:5432/db"  # Hardcoded!
-```
-
----
-
-## Next Steps
-1. **Verify GitHub Secret** (FIX #1)
-2. **Update Workflow File** (FIX #2)
-3. **Test Connection** with `psql` directly
-4. **Run Telemetry Diagnostics** (FIX #3-6)
-5. **Re-run GitHub Actions** workflow
-6. **Monitor Logs** for clear error messages
-
----
-
-**Status:** Awaiting your input on Supabase access and environment details.
