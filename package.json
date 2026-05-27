@@ -1,0 +1,14 @@
+{
+  "name": "kzdi-platform",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "lint": "eslint .",
+    "test": "jest",
+    "audit": "npm audit"
+  },
+  "devDependencies": {
+    "eslint": "^8.0.0",
+    "jest": "^29.0.0"
+  }
+}
