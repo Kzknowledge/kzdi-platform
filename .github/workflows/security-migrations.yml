@@ -1,0 +1,128 @@
+name: KZDI Security Migrations
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'migrations/security/**.sql'
+  workflow_dispatch:
+    inputs:
+      migration_file:
+        description: 'Specific migration file to run (leave empty to run all pending)'
+        required: false
+        type: string
+
+jobs:
+  security-migration:
+    name: Apply Security Migration
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client
+
+      - name: Verify migration files exist
+        run: |
+          echo "=== Security migration files ==="
+          ls -la migrations/security/*.sql
+          echo "Total: $(ls migrations/security/*.sql | wc -l) files"
+
+      - name: Run pre-flight session check
+        env:
+          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: |
+          ACTIVE=$(psql \
+            -h ${{ secrets.SUPABASE_DB_HOST }} \
+            -p 5432 \
+            -U postgres \
+            -d postgres \
+            -t -c "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query NOT ILIKE '%pg_stat_activity%' AND query NOT ILIKE '%idle%';" \
+            | tr -d '[:space:]')
+          echo "Active sessions: $ACTIVE"
+          if [ "$ACTIVE" -gt "5" ]; then
+            echo "WARNING: $ACTIVE active sessions detected. Migration proceeding but monitor closely."
+          fi
+
+      - name: Apply security migrations
+        env:
+          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: |
+          if [ -n "${{ github.event.inputs.migration_file }}" ]; then
+            echo "=== Running specific migration: ${{ github.event.inputs.migration_file }} ==="
+            psql \
+              -h ${{ secrets.SUPABASE_DB_HOST }} \
+              -p 5432 \
+              -U postgres \
+              -d postgres \
+              -v ON_ERROR_STOP=1 \
+              -f "migrations/security/${{ github.event.inputs.migration_file }}"
+          else
+            echo "=== Running all security migrations in order ==="
+            for file in $(ls migrations/security/*.sql | sort); do
+              echo "--- Applying: $file ---"
+              psql \
+                -h ${{ secrets.SUPABASE_DB_HOST }} \
+                -p 5432 \
+                -U postgres \
+                -d postgres \
+                -v ON_ERROR_STOP=1 \
+                -f "$file"
+              echo "--- Completed: $file ---"
+            done
+          fi
+
+      - name: Post-migration verification
+        env:
+          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: |
+          echo "=== Verifying RLS policies ==="
+          psql \
+            -h ${{ secrets.SUPABASE_DB_HOST }} \
+            -p 5432 \
+            -U postgres \
+            -d postgres \
+            -c "SELECT schemaname, tablename, policyname, roles, cmd, qual
+                FROM pg_policies
+                WHERE schemaname = 'event_bus'
+                ORDER BY tablename, policyname;"
+
+          echo "=== Verifying EXECUTE grants ==="
+          psql \
+            -h ${{ secrets.SUPABASE_DB_HOST }} \
+            -p 5432 \
+            -U postgres \
+            -d postgres \
+            -c "SELECT grantee, routine_name, privilege_type
+                FROM information_schema.role_routine_grants
+                WHERE routine_name = 'process_mcp_event_v2'
+                ORDER BY grantee;"
+
+          echo "=== Verifying function search_path ==="
+          psql \
+            -h ${{ secrets.SUPABASE_DB_HOST }} \
+            -p 5432 \
+            -U postgres \
+            -d postgres \
+            -c "SELECT proname, proconfig
+                FROM pg_proc
+                JOIN pg_namespace ON pg_proc.pronamespace = pg_namespace.oid
+                WHERE nspname = 'public'
+                AND proname = 'process_mcp_event_v2';"
+
+      - name: Migration summary
+        if: always()
+        run: |
+          echo "================================================"
+          echo "KZDI Security Migration Complete"
+          echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "ISO 27001 controls: A.8.3, A.8.4, A.8.28"
+          echo "================================================"
