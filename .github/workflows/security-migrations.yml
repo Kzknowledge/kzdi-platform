@@ -40,7 +40,7 @@ jobs:
           ACTIVE=$(psql \
             -h ${{ secrets.SUPABASE_DB_HOST }} \
             -p 5432 \
-            -U postgres \
+            -U postgres.qpoooqpcjmbwkzjeyczxs \
             -d postgres \
             -t -c "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query NOT ILIKE '%pg_stat_activity%' AND query NOT ILIKE '%idle%';" \
             | tr -d '[:space:]')
@@ -58,7 +58,7 @@ jobs:
             psql \
               -h ${{ secrets.SUPABASE_DB_HOST }} \
               -p 5432 \
-              -U postgres \
+              -U postgres.qpoooqpcjmbwkzjeyczxs \
               -d postgres \
               -v ON_ERROR_STOP=1 \
               -f "migrations/security/${{ github.event.inputs.migration_file }}"
@@ -69,7 +69,7 @@ jobs:
               psql \
                 -h ${{ secrets.SUPABASE_DB_HOST }} \
                 -p 5432 \
-                -U postgres \
+                -U postgres.qpoooqpcjmbwkzjeyczxs \
                 -d postgres \
                 -v ON_ERROR_STOP=1 \
                 -f "$file"
@@ -85,7 +85,7 @@ jobs:
           psql \
             -h ${{ secrets.SUPABASE_DB_HOST }} \
             -p 5432 \
-            -U postgres \
+            -U postgres.qpoooqpcjmbwkzjeyczxs \
             -d postgres \
             -c "SELECT schemaname, tablename, policyname, roles, cmd, qual
                 FROM pg_policies
@@ -96,7 +96,7 @@ jobs:
           psql \
             -h ${{ secrets.SUPABASE_DB_HOST }} \
             -p 5432 \
-            -U postgres \
+            -U postgres.qpoooqpcjmbwkzjeyczxs \
             -d postgres \
             -c "SELECT grantee, routine_name, privilege_type
                 FROM information_schema.role_routine_grants
@@ -107,7 +107,7 @@ jobs:
           psql \
             -h ${{ secrets.SUPABASE_DB_HOST }} \
             -p 5432 \
-            -U postgres \
+            -U postgres.qpoooqpcjmbwkzjeyczxs \
             -d postgres \
             -c "SELECT proname, proconfig
                 FROM pg_proc
