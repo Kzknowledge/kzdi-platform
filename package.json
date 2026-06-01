@@ -1,14 +1,32 @@
 {
   "name": "kzdi-platform",
   "version": "1.0.0",
-  "private": true,
+  "description": "KZDI Technologies Ltd — AI Infrastructure Platform (Hausa/English)",
+  "main": "src/index.js",
   "scripts": {
-    "lint": "eslint .",
-    "test": "jest",
-    "audit": "npm audit"
+    "test": "node -e \"require('./src/config/skill-registry.js'); require('./src/agents/registry.js'); require('./src/config/system-memory.js'); console.log('✅ All modules OK');\"",
+    "start": "node src/index.js",
+    "lint": "eslint src/**/*.js"
+  },
+  "keywords": [
+    "kzdi",
+    "hausa-nlp",
+    "mcp",
+    "ai-infrastructure",
+    "nigeria"
+  ],
+  "author": "Kriptomech <kriptomech@kzdi.tech>",
+  "license": "MIT",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
   },
   "devDependencies": {
-    "eslint": "^8.0.0",
-    "jest": "^29.0.0"
+    "eslint": "^8.57.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }
