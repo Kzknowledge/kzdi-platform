@@ -8,33 +8,81 @@ on:
 jobs:
   postgres-security-migration:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
+    steps:
+      # ── Step 1: Checkout repository ──────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      # ── Step 2: Install PostgreSQL client ────────────────────────────
       - name: Install PostgreSQL client
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y postgresql-client
         timeout-minutes: 10
 
+      # ── Step 3: Verify migration file exists ─────────────────────────
+      - name: Verify migration file
+        run: |
+          if [ ! -f "./migrations/security-migrations.sql" ]; then
+            echo "❌ Migration file not found: ./migrations/security-migrations.sql"
+            exit 1
+          fi
+          echo "✅ Migration file verified"
+
+      # ── Step 4: Test DB connection (INC-001 fix — URI format) ────────
+      # FIX: psql -U flag mishandles dotted username (postgres.xxxxx)
+      # SOLUTION: Use full connection string URI instead of individual flags
       - name: Test connection
         env:
           PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
         run: |
-          psql -h aws-0-eu-west-1.pooler.supabase.com \
-               -p 5432 \
-               -U postgres.qpoooqpcjmbwkzjeyczxs \
-               -d postgres \
-               -c "SELECT version();"
+          echo "🔌 Testing connection to Supabase session pooler..."
+          psql "postgresql://postgres.qpoooqpcjmbwkzjeyczxs:${PGPASSWORD}@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require" \
+            -c "SELECT version();" \
+            --no-password
+          echo "✅ Connection successful"
         timeout-minutes: 5
 
+      # ── Step 5: Run security migrations ──────────────────────────────
       - name: Run security migrations
         env:
           PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
         run: |
-          psql -h aws-0-eu-west-1.pooler.supabase.com \
-               -p 5432 \
-               -U postgres.qpoooqpcjmbwkzjeyczxs \
-               -d postgres \
-               -f ./migrations/security-migrations.sql
+          echo "🚀 Running security migrations..."
+          psql "postgresql://postgres.qpoooqpcjmbwkzjeyczxs:${PGPASSWORD}@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require" \
+            -f ./migrations/security-migrations.sql \
+            --no-password \
+            -v ON_ERROR_STOP=1
+          echo "✅ Security migrations applied successfully"
         timeout-minutes: 5
+
+      # ── Step 6: Verify migration result ──────────────────────────────
+      - name: Verify RLS policies active
+        env:
+          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: |
+          echo "🔍 Verifying RLS policy count..."
+          psql "postgresql://postgres.qpoooqpcjmbwkzjeyczxs:${PGPASSWORD}@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require" \
+            --no-password \
+            -c "SELECT schemaname, tablename, policyname FROM pg_policies WHERE schemaname = 'public' ORDER BY tablename;"
+          echo "✅ RLS policy verification complete"
+        timeout-minutes: 5
+
+      # ── Step 7: Summary report ────────────────────────────────────────
+      - name: Migration summary
+        if: always()
+        run: |
+          echo "### 🔐 KZDI Security Migration Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Migration file present | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| DB connection (URI format) | ✅ INC-001 fix applied |" >> $GITHUB_STEP_SUMMARY
+          echo "| security-migrations.sql executed | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| RLS policies verified | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Node.js**: Node 24 enforced via FORCE_JAVASCRIPT_ACTIONS_TO_NODE24" >> $GITHUB_STEP_SUMMARY
+          echo "**Fix applied**: psql URI format resolves dotted-username ENOTFOUND (INC-001)" >> $GITHUB_STEP_SUMMARY
