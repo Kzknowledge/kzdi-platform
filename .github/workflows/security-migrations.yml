@@ -1,102 +1,475 @@
-name: security-migrations
+# =============================================================================
+# KZDI Talent OS MVP — Security Migrations Pipeline
+# File:    .github/workflows/security-migrations.yml
+# Project: qpooqpcjmbwkzjeyczxs
+# Author:  KZDI DevSecOps
+# Version: 2.0.0
+#
+# ARCHITECTURE CONSTRAINTS (HARD RULES — DO NOT MODIFY):
+#   - Session Pooler ONLY   → port 5432
+#   - Transaction Pooler    → port 6543 PROHIBITED
+#   - No pooler→direct fallback switching
+#   - Fail-fast execution   → ON_ERROR_STOP enforced
+#   - SSL required          → sslmode=require
+#   - connect_timeout=10    → enforced on all psql calls
+#   - Secrets scoped per step (never global env)
+#   - Node.js 24 compatible actions
+# =============================================================================
+
+name: "KZDI Security Migrations"
 
 on:
   push:
-    branches: [main, develop]
+    branches:
+      - main
+      - "release/**"
+    paths:
+      - "migrations/**"
+      - ".github/workflows/security-migrations.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "migrations/**"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run only — validates SQL, no execution"
+        required: false
+        default: "false"
+        type: boolean
+      migration_file:
+        description: "Single migration file to run (leave blank for all pending)"
+        required: false
+        type: string
 
-# 🔐 Global environment (CI stability + Node 24 enforcement)
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+# No global env block — secrets are scoped per step (DevSecOps requirement)
+
+permissions:
+  contents: read
+  id-token: write    # OIDC for future cloud auth
+  actions: read
+
+concurrency:
+  group: "migrations-${{ github.ref }}"
+  cancel-in-progress: false   # Never cancel an in-progress migration
 
 jobs:
-  postgres-security-migration:
-    runs-on: ubuntu-latest
+  # ---------------------------------------------------------------------------
+  # JOB 1: Pre-flight validation (no DB connection required)
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: "Pre-flight: Validate Migration Files"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    outputs:
+      migration_count: ${{ steps.scan.outputs.migration_count }}
+      migration_files: ${{ steps.scan.outputs.migration_files }}
+      has_migrations:  ${{ steps.scan.outputs.has_migrations }}
 
     steps:
-      # ─────────────────────────────────────────────
-      # 1. Checkout repository
-      # ─────────────────────────────────────────────
-      - name: Checkout code
+      - name: "Checkout repository"
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      # ─────────────────────────────────────────────
-      # 2. Install PostgreSQL client
-      # ─────────────────────────────────────────────
-      - name: Install PostgreSQL client
+      - name: "Verify migration directory exists"
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y postgresql-client
-        timeout-minutes: 10
-
-      # ─────────────────────────────────────────────
-      # 3. Verify migration file exists
-      # ─────────────────────────────────────────────
-      - name: Verify migration file
-        run: |
-          if [ ! -f "./migrations/security-migrations.sql" ]; then
-            echo "❌ Migration file not found: ./migrations/security-migrations.sql"
+          if [ ! -d "migrations" ]; then
+            echo "::error::migrations/ directory not found"
             exit 1
           fi
-          echo "✅ Migration file verified"
+          echo "✅ migrations/ directory present"
 
-      # ─────────────────────────────────────────────
-      # 4. Test DB connection (Supabase pooler)
-      # ─────────────────────────────────────────────
-      - name: Test connection
-        env:
-          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      - name: "Scan and validate migration files"
+        id: scan
         run: |
-          echo "🔌 Testing Supabase connection..."
-          psql "postgresql://postgres.qpoooqpcjmbwkzjeyczxs:${PGPASSWORD}@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require" \
-            -c "SELECT version();" \
-            --no-password
-          echo "✅ Connection successful"
-        timeout-minutes: 5
+          set -euo pipefail
 
-      # ─────────────────────────────────────────────
-      # 5. Run security migrations
-      # ─────────────────────────────────────────────
-      - name: Run security migrations
-        env:
-          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          # Collect .sql files sorted by name (timestamp-prefixed order)
+          FILES=$(find migrations/ -maxdepth 1 -name "*.sql" | sort)
+
+          if [ -z "$FILES" ]; then
+            echo "has_migrations=false" >> "$GITHUB_OUTPUT"
+            echo "migration_count=0"    >> "$GITHUB_OUTPUT"
+            echo "migration_files="    >> "$GITHUB_OUTPUT"
+            echo "ℹ️  No migration files found — pipeline will skip execution"
+            exit 0
+          fi
+
+          COUNT=$(echo "$FILES" | wc -l | tr -d ' ')
+          echo "has_migrations=true"    >> "$GITHUB_OUTPUT"
+          echo "migration_count=$COUNT" >> "$GITHUB_OUTPUT"
+          # JSON array for downstream consumption
+          JSON=$(echo "$FILES" | jq -R . | jq -s -c .)
+          echo "migration_files=$JSON"  >> "$GITHUB_OUTPUT"
+          echo "📦 Found $COUNT migration file(s):"
+          echo "$FILES"
+
+      - name: "Validate migration file naming convention"
         run: |
-          echo "🚀 Running security migrations..."
-          psql "postgresql://postgres.qpoooqpcjmbwkzjeyczxs:${PGPASSWORD}@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require" \
-            -f ./migrations/security-migrations.sql \
-            --no-password \
-            -v ON_ERROR_STOP=1
-          echo "✅ Migrations completed"
-        timeout-minutes: 10
+          set -euo pipefail
+          INVALID=0
+          for f in migrations/*.sql; do
+            [ -e "$f" ] || continue
+            BASENAME=$(basename "$f")
+            # Expected: YYYYMMDDHHMMSS_description.sql
+            if ! echo "$BASENAME" | grep -qE '^[0-9]{14}_[a-z0-9_]+\.sql$'; then
+              echo "::error file=$f::Invalid naming: expected YYYYMMDDHHMMSS_description.sql, got: $BASENAME"
+              INVALID=$((INVALID + 1))
+            fi
+          done
+          if [ $INVALID -gt 0 ]; then
+            echo "::error::$INVALID migration file(s) have invalid naming. Fix before merging."
+            exit 1
+          fi
+          echo "✅ All migration filenames conform to convention"
 
-      # ─────────────────────────────────────────────
-      # 6. Verify RLS policies
-      # ─────────────────────────────────────────────
-      - name: Verify RLS policies active
-        env:
-          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      - name: "Validate required file headers"
         run: |
-          echo "🔍 Checking RLS policies..."
-          psql "postgresql://postgres.qpoooqpcjmbwkzjeyczxs:${PGPASSWORD}@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require" \
-            --no-password \
-            -c "SELECT schemaname, tablename, policyname FROM pg_policies WHERE schemaname = 'public' ORDER BY tablename;"
-          echo "✅ RLS verification complete"
-        timeout-minutes: 5
+          set -euo pipefail
+          MISSING=0
+          for f in migrations/*.sql; do
+            [ -e "$f" ] || continue
+            # Every migration must declare its target schema and have rollback note
+            if ! grep -q "^-- MIGRATION:" "$f"; then
+              echo "::error file=$f::Missing required header line: -- MIGRATION:"
+              MISSING=$((MISSING + 1))
+            fi
+            if ! grep -q "^-- ROLLBACK:" "$f"; then
+              echo "::error file=$f::Missing required header line: -- ROLLBACK:"
+              MISSING=$((MISSING + 1))
+            fi
+          done
+          if [ $MISSING -gt 0 ]; then
+            echo "::error::$MISSING header violation(s). All migrations must have MIGRATION and ROLLBACK headers."
+            exit 1
+          fi
+          echo "✅ All migration headers valid"
 
-      # ─────────────────────────────────────────────
-      # 7. GitHub summary report
-      # ─────────────────────────────────────────────
-      - name: Migration summary
+      - name: "Static SQL safety scan"
+        run: |
+          set -euo pipefail
+          UNSAFE=0
+          for f in migrations/*.sql; do
+            [ -e "$f" ] || continue
+            # Detect dangerous DDL that must be explicit and reviewed
+            if grep -qiE '^\s*DROP\s+(DATABASE|SCHEMA)\b' "$f"; then
+              echo "::error file=$f::Unsafe statement detected: DROP DATABASE / DROP SCHEMA"
+              UNSAFE=$((UNSAFE + 1))
+            fi
+            if grep -qiE '^\s*TRUNCATE\b' "$f"; then
+              echo "::warning file=$f::TRUNCATE detected — ensure this is intentional"
+            fi
+            # Block any reference to port 6543 (transaction pooler) in files
+            if grep -q "6543" "$f"; then
+              echo "::error file=$f::Port 6543 (transaction pooler) reference found — prohibited"
+              UNSAFE=$((UNSAFE + 1))
+            fi
+          done
+          if [ $UNSAFE -gt 0 ]; then
+            echo "::error::$UNSAFE unsafe statement(s) detected. Review required."
+            exit 1
+          fi
+          echo "✅ Static SQL safety scan passed"
+
+  # ---------------------------------------------------------------------------
+  # JOB 2: Connectivity probe (validates credentials, no migration execution)
+  # ---------------------------------------------------------------------------
+  connectivity:
+    name: "Connectivity: Session Pooler Probe"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    needs: preflight
+    if: needs.preflight.outputs.has_migrations == 'true'
+
+    steps:
+      - name: "Install PostgreSQL client"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client-16
+          psql --version
+
+      - name: "Probe Session Pooler — port 5432 ONLY"
+        # Secrets scoped to this step only — never set as global env
+        env:
+          PGPASSWORD:    ${{ secrets.SUPABASE_DB_PASSWORD }}
+          PGHOST:        ${{ secrets.SUPABASE_SESSION_POOLER_HOST }}
+          PGPORT:        "5432"
+          PGDATABASE:    "postgres"
+          PGUSER:        ${{ secrets.SUPABASE_DB_USER }}
+          PGSSLMODE:     "require"
+          PGCONNECT_TIMEOUT: "10"
+        run: |
+          set -euo pipefail
+          echo "🔌 Probing Session Pooler: $PGHOST:$PGPORT"
+
+          # Single SELECT — no migration logic
+          RESULT=$(psql \
+            --no-psqlrc \
+            --set ON_ERROR_STOP=on \
+            --tuples-only \
+            --command "SELECT 'KZDI_PROBE_OK' AS status, version() AS pg_version, NOW() AS ts;" \
+            2>&1)
+
+          if echo "$RESULT" | grep -q "KZDI_PROBE_OK"; then
+            echo "✅ Session Pooler connection confirmed"
+            echo "$RESULT"
+          else
+            echo "::error::Session Pooler probe failed"
+            echo "$RESULT"
+            exit 1
+          fi
+
+      - name: "Verify telemetry schema accessibility"
+        env:
+          PGPASSWORD:    ${{ secrets.SUPABASE_DB_PASSWORD }}
+          PGHOST:        ${{ secrets.SUPABASE_SESSION_POOLER_HOST }}
+          PGPORT:        "5432"
+          PGDATABASE:    "postgres"
+          PGUSER:        ${{ secrets.SUPABASE_DB_USER }}
+          PGSSLMODE:     "require"
+          PGCONNECT_TIMEOUT: "10"
+        run: |
+          set -euo pipefail
+          echo "🔍 Verifying telemetry schema..."
+          psql \
+            --no-psqlrc \
+            --set ON_ERROR_STOP=on \
+            --tuples-only \
+            --command "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'telemetry';" \
+          | grep -q "telemetry" && echo "✅ telemetry schema exists" || {
+            echo "::warning::telemetry schema not found — migration may create it"
+          }
+
+  # ---------------------------------------------------------------------------
+  # JOB 3: Migration execution (fail-fast, ON_ERROR_STOP, no fallback)
+  # ---------------------------------------------------------------------------
+  migrate:
+    name: "Migrate: Execute on Session Pooler"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [preflight, connectivity]
+    if: |
+      needs.preflight.outputs.has_migrations == 'true' &&
+      github.event.inputs.dry_run != 'true'
+    environment: production   # Requires manual approval gate in GitHub settings
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "Install PostgreSQL client"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client-16
+          psql --version
+
+      - name: "Create migration audit log"
+        run: |
+          mkdir -p /tmp/kzdi-audit
+          echo "KZDI Migration Run — $(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/kzdi-audit/run.log
+          echo "Workflow:  $GITHUB_WORKFLOW"    >> /tmp/kzdi-audit/run.log
+          echo "Run ID:    $GITHUB_RUN_ID"      >> /tmp/kzdi-audit/run.log
+          echo "SHA:       $GITHUB_SHA"         >> /tmp/kzdi-audit/run.log
+          echo "Actor:     $GITHUB_ACTOR"       >> /tmp/kzdi-audit/run.log
+          echo "Ref:       $GITHUB_REF"         >> /tmp/kzdi-audit/run.log
+          echo "---"                            >> /tmp/kzdi-audit/run.log
+
+      - name: "Execute migrations — Session Pooler :5432, fail-fast"
+        id: execute
+        env:
+          PGPASSWORD:    ${{ secrets.SUPABASE_DB_PASSWORD }}
+          PGHOST:        ${{ secrets.SUPABASE_SESSION_POOLER_HOST }}
+          PGPORT:        "5432"
+          PGDATABASE:    "postgres"
+          PGUSER:        ${{ secrets.SUPABASE_DB_USER }}
+          PGSSLMODE:     "require"
+          PGCONNECT_TIMEOUT: "10"
+        run: |
+          set -euo pipefail
+
+          echo "🚀 Starting migration execution"
+          echo "   Host:     $PGHOST"
+          echo "   Port:     $PGPORT (Session Pooler)"
+          echo "   SSL:      $PGSSLMODE"
+          echo "   Timeout:  ${PGCONNECT_TIMEOUT}s"
+          echo ""
+
+          MIGRATION_FILES=$(find migrations/ -maxdepth 1 -name "*.sql" | sort)
+          TOTAL=$(echo "$MIGRATION_FILES" | wc -l | tr -d ' ')
+          CURRENT=0
+          FAILED=0
+
+          for MIGRATION_FILE in $MIGRATION_FILES; do
+            CURRENT=$((CURRENT + 1))
+            BASENAME=$(basename "$MIGRATION_FILE")
+            echo "📄 [$CURRENT/$TOTAL] Executing: $BASENAME"
+            echo "$(date -u +%H:%M:%SZ) START $BASENAME" >> /tmp/kzdi-audit/run.log
+
+            # Execute with ON_ERROR_STOP — single failure aborts immediately
+            # No retry. No fallback. Fail-fast.
+            if psql \
+              --no-psqlrc \
+              --set ON_ERROR_STOP=on \
+              --echo-errors \
+              --file="$MIGRATION_FILE" \
+              2>&1 | tee -a /tmp/kzdi-audit/run.log; then
+              echo "   ✅ $BASENAME — OK"
+              echo "$(date -u +%H:%M:%SZ) PASS $BASENAME" >> /tmp/kzdi-audit/run.log
+            else
+              FAILED=$((FAILED + 1))
+              echo "$(date -u +%H:%M:%SZ) FAIL $BASENAME" >> /tmp/kzdi-audit/run.log
+              echo ""
+              echo "::error file=$MIGRATION_FILE::Migration FAILED: $BASENAME"
+              echo "::error::Halting pipeline. No further migrations will execute."
+              echo "::error::Investigate and apply manual rollback if data was modified."
+              echo "failed_file=$BASENAME" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          done
+
+          echo ""
+          echo "✅ All $TOTAL migration(s) completed successfully"
+          echo "completed=$TOTAL" >> "$GITHUB_OUTPUT"
+
+      - name: "Post-migration schema integrity check"
+        if: success()
+        env:
+          PGPASSWORD:    ${{ secrets.SUPABASE_DB_PASSWORD }}
+          PGHOST:        ${{ secrets.SUPABASE_SESSION_POOLER_HOST }}
+          PGPORT:        "5432"
+          PGDATABASE:    "postgres"
+          PGUSER:        ${{ secrets.SUPABASE_DB_USER }}
+          PGSSLMODE:     "require"
+          PGCONNECT_TIMEOUT: "10"
+        run: |
+          set -euo pipefail
+          echo "🔍 Post-migration integrity check..."
+
+          psql \
+            --no-psqlrc \
+            --set ON_ERROR_STOP=on \
+            --command "
+              SELECT
+                schemaname,
+                tablename,
+                tableowner
+              FROM pg_tables
+              WHERE schemaname IN ('public', 'telemetry')
+              ORDER BY schemaname, tablename;
+            "
+          echo "✅ Schema integrity check complete"
+
+      - name: "Upload audit log"
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "migration-audit-${{ github.run_id }}"
+          path: /tmp/kzdi-audit/
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # JOB 4: Dry-run path (manual trigger only)
+  # ---------------------------------------------------------------------------
+  dry-run:
+    name: "Dry Run: Validate SQL Only"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: preflight
+    if: github.event.inputs.dry_run == 'true'
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Install PostgreSQL client"
         run: |
-          echo "### 🔐 KZDI Security Migration Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Migration file present | ✅ |" >> $GITHUB_STEP_SUMMARY
-          echo "| DB connection (Supabase pooler) | ✅ |" >> $GITHUB_STEP_SUMMARY
-          echo "| security-migrations.sql executed | ✅ |" >> $GITHUB_STEP_SUMMARY
-          echo "| RLS policies verified | ✅ |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Node.js**: Node 24 enforced (GitHub Actions compatible)**" >> $GITHUB_STEP_SUMMARY
-          echo "**Status**: Production-ready CI/CD pipeline stable**" >> $GITHUB_STEP_SUMMARY
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client-16
+
+      - name: "Syntax validation (no execution)"
+        env:
+          PGPASSWORD:    ${{ secrets.SUPABASE_DB_PASSWORD }}
+          PGHOST:        ${{ secrets.SUPABASE_SESSION_POOLER_HOST }}
+          PGPORT:        "5432"
+          PGDATABASE:    "postgres"
+          PGUSER:        ${{ secrets.SUPABASE_DB_USER }}
+          PGSSLMODE:     "require"
+          PGCONNECT_TIMEOUT: "10"
+        run: |
+          set -euo pipefail
+          echo "🔎 DRY RUN — syntax validation only, no mutations"
+
+          for MIGRATION_FILE in $(find migrations/ -maxdepth 1 -name "*.sql" | sort); do
+            BASENAME=$(basename "$MIGRATION_FILE")
+            echo "Checking: $BASENAME"
+
+            # Wrap in ROLLBACK to prevent any mutations
+            WRAPPED=$(cat <<-SQL
+          BEGIN;
+          $(cat "$MIGRATION_FILE")
+          ROLLBACK;
+          SQL
+            )
+            echo "$WRAPPED" | psql \
+              --no-psqlrc \
+              --set ON_ERROR_STOP=on \
+              --echo-errors \
+              2>&1 || {
+                echo "::error file=$MIGRATION_FILE::Syntax error in $BASENAME"
+                exit 1
+              }
+            echo "  ✅ $BASENAME — syntax OK"
+          done
+          echo "✅ All files passed dry-run validation"
+
+  # ---------------------------------------------------------------------------
+  # JOB 5: Post-deployment Telegram notification
+  # ---------------------------------------------------------------------------
+  notify:
+    name: "Notify: Deployment Result"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    needs: [migrate]
+    if: always() && needs.migrate.result != 'skipped'
+
+    steps:
+      - name: "Send Telegram notification"
+        env:
+          BOT_TOKEN: ${{ secrets.KZDI_TELEGRAM_BOT_TOKEN }}
+          CHAT_ID:   ${{ secrets.KZDI_TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          STATUS="${{ needs.migrate.result }}"
+          SHA_SHORT="${GITHUB_SHA:0:7}"
+
+          if [ "$STATUS" = "success" ]; then
+            ICON="✅"
+            MSG="<b>KZDI Migration PASSED</b>"
+          else
+            ICON="🚨"
+            MSG="<b>KZDI Migration FAILED</b>"
+          fi
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "chat_id": "$CHAT_ID",
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+            "text": "$ICON $MSG\n\n<b>Project:</b> qpooqpcjmbwkzjeyczxs\n<b>Run:</b> <a href=\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\">#$GITHUB_RUN_NUMBER</a>\n<b>SHA:</b> <code>$SHA_SHORT</code>\n<b>Actor:</b> $GITHUB_ACTOR\n<b>Branch:</b> $GITHUB_REF_NAME"
+          }
+          EOF
+          )
+
+          curl --silent --fail \
+            --max-time 10 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
+
