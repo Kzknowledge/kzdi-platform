@@ -15,7 +15,7 @@
 --   - Session Pooler ONLY: qpooqpcjmbwkzjeyczxs.supabase.co:5432
 --   - SSL required: sslmode=require
 --   - Transaction isolation: READ COMMITTED
---   - Fail-fast: ON_ERROR_STOP enforced
+--   - Error handling: ON_ERROR_STOP enforced at psql invocation (workflow level)
 --
 -- ROLLBACK:
 --   If this migration fails or needs reversal, execute:
@@ -27,9 +27,10 @@
 
 BEGIN;
 
--- Set transaction isolation and error handling
+-- Set transaction isolation
+-- Note: ON_ERROR_STOP is enforced by psql --set ON_ERROR_STOP=on (workflow level)
+-- Do NOT use SET LOCAL ON_ERROR_STOP — it's a psql client variable, not a server parameter
 SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
-SET LOCAL ON_ERROR_STOP = on;
 
 -- Verify target schema exists
 DO $$
@@ -125,3 +126,4 @@ COMMIT;
 -- Columns:   event_type, user_id, metadata
 -- Indexes:   3 (event_type, user_event, metadata_gin)
 -- Duration:  ~50ms (expected)
+
