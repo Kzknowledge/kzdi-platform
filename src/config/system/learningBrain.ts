@@ -36,62 +36,80 @@ export class MCPLearningBrain {
       .map((e: any) => ({
         agent: e.event_data?.agent || "unknown",
         success: e.event_data?.status === "success",
-        vector_strength: e.event_data?.vector_strength || 0.5,
-        graph_strength: e.event_data?.graph_strength || 0.5,
-        duration_ms: e.event_data?.duration_ms || 0
+        vector_strength: Number(e.event_data?.vector_strength ?? 0),
+        graph_strength: Number(e.event_data?.graph_strength ?? 0),
+        duration_ms: Number(e.event_data?.duration_ms ?? 0),
       }));
   }
 
   /**
-   * Compute adaptive weights for decision engine
+   * Compute adaptive weights for decision engine (STABILIZED VERSION)
    */
   async computeAdaptiveWeights() {
     const signals = await this.fetchRecentSignals(100);
 
-    if (signals.length === 0) {
+    if (signals.length < 5) {
       return {
         vectorWeight: 0.5,
         graphWeight: 0.5,
-        agentBias: {}
+        agentBias: {},
       };
     }
 
-    let vectorSuccess = 0;
-    let graphSuccess = 0;
-    let total = signals.length;
+    let vectorSuccessRate = 0;
+    let graphSuccessRate = 0;
 
-    const agentPerformance: Record<string, { success: number; total: number }> = {};
+    const agentPerformance: Record<
+      string,
+      { success: number; total: number }
+    > = {};
 
     for (const s of signals) {
-      if (s.vector_strength > s.graph_strength) {
-        vectorSuccess += s.success ? 1 : 0;
-      } else {
-        graphSuccess += s.success ? 1 : 0;
-      }
-
+      // 🔷 initialize agent stats
       if (!agentPerformance[s.agent]) {
         agentPerformance[s.agent] = { success: 0, total: 0 };
       }
 
       agentPerformance[s.agent].total += 1;
       if (s.success) agentPerformance[s.agent].success += 1;
+
+      // 🔷 stable contribution logic (NOT comparison-based)
+      const vectorContribution = s.vector_strength * (s.success ? 1 : 0);
+      const graphContribution = s.graph_strength * (s.success ? 1 : 0);
+
+      vectorSuccessRate += vectorContribution;
+      graphSuccessRate += graphContribution;
     }
 
-    // 🔷 Adaptive weights
-    const vectorWeight = vectorSuccess / total || 0.5;
-    const graphWeight = graphSuccess / total || 0.5;
+    const total = signals.length;
 
-    // 🔷 Agent bias scoring
+    // 🔷 normalized + smoothed weights
+    const vectorWeight = Math.min(
+      0.85,
+      Math.max(0.3, vectorSuccessRate / total + 0.1)
+    );
+
+    const graphWeight = Math.min(
+      0.85,
+      Math.max(0.3, graphSuccessRate / total + 0.1)
+    );
+
+    // 🔷 agent bias scoring (smoothed)
     const agentBias: Record<string, number> = {};
 
     Object.entries(agentPerformance).forEach(([agent, stats]) => {
-      agentBias[agent] = stats.success / stats.total;
+      const ratio = stats.success / stats.total;
+
+      // smoothing to avoid overfitting
+      agentBias[agent] = Number(
+        (0.1 + ratio * 0.9).toFixed(3)
+      );
     });
 
     return {
       vectorWeight,
       graphWeight,
-      agentBias
+      agentBias,
     };
   }
 
@@ -102,10 +120,10 @@ export class MCPLearningBrain {
     const weights = await this.computeAdaptiveWeights();
 
     let bestAgent = candidates[0];
-    let bestScore = 0;
+    let bestScore = -Infinity;
 
     for (const agent of candidates) {
-      const score = weights.agentBias[agent] || 0.5;
+      const score = weights.agentBias[agent] ?? 0.5;
 
       if (score > bestScore) {
         bestScore = score;
@@ -116,7 +134,7 @@ export class MCPLearningBrain {
     return {
       bestAgent,
       confidence: bestScore,
-      weights
+      weights,
     };
   }
 }
