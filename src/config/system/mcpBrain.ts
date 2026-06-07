@@ -7,6 +7,9 @@ import { MCPLearningBrain } from "./learningBrain";
 import { MCPAutonomyEngine } from "./autonomyEngine";
 import { MCPTraceEngine } from "./trace";
 
+import { MCPCompetitionEngine } from "./competitionEngine";
+import { EvolutionRegistry } from "./evolutionRegistry";
+
 import {
   getSystemMemory,
   applySystemUpdate,
@@ -28,6 +31,9 @@ export class MCPBrain {
   private governor = new MCPGovernor();
   private learningBrain = new MCPLearningBrain();
   private autonomyEngine = new MCPAutonomyEngine();
+
+  private competitionEngine = new MCPCompetitionEngine();
+  private evolutionRegistry = new EvolutionRegistry();
 
   /**
    * 🧠 MAIN MCP EXECUTION PIPELINE
@@ -65,39 +71,90 @@ export class MCPBrain {
     // ===============================
     // 🔷 4. VECTOR SEARCH
     // ===============================
-    const vectorResults = await this.vectorSearch(queryEmbedding);
+    const vectorResultsRaw = await this.vectorSearch(queryEmbedding);
+
+    const vectorResults = (vectorResultsRaw || []).map((v: any) => ({
+      id: v?.id ?? "unknown",
+      score: v?.score ?? 0,
+    }));
+
     const nodeIds = vectorResults.map((v) => v.id);
 
     await trace.logVectorSearch(query, vectorResults.length);
 
     // ===============================
-    // 🕸 5. GRAPH EXPANSION
+    // 🕸 5. GRAPH TRAVERSAL
     // ===============================
-    const graphEdges = await this.graphTraversal(nodeIds);
+    const graphEdgesRaw = await this.graphTraversal(nodeIds);
+
+    const graphEdges = (graphEdgesRaw || []).map((e: any) => ({
+      from_node_id: e?.from_node_id ?? "",
+      to_node_id: e?.to_node_id ?? "",
+      label: e?.label ?? "unknown",
+      strength: e?.strength ?? 0.5,
+    }));
 
     await trace.logGraphTraversal(nodeIds);
 
     // ===============================
-    // 🧭 6. DECISION ENGINE (MEMORY-AWARE)
+    // ⚔️ 6. MULTI-AGENT COMPETITION
     // ===============================
-    const decision = await this.decisionEngine.selectAgent({
+    const competition = this.competitionEngine.run({
       query,
       vectorResults,
       graphNodes: nodeIds,
       agents: AGENT_REGISTRY,
     });
 
+    const decision = competition?.winner?.agent;
+
+    if (!decision) {
+      await trace.log({ type: "competition_failed_no_winner" });
+      throw new Error("No agent selected by competition engine");
+    }
+
     await trace.log({
-      type: "agent_selected",
-      agent: decision.id,
-      score: decision.score,
-      memoryInfluenced: decision.memoryInfluenced,
+      type: "agent_competition_result",
+      winner: decision.id,
+      score: competition.winner.score,
+      ranking: competition.ranking.map((r) => ({
+        id: r?.agent?.id ?? "unknown",
+        score: r?.score ?? 0,
+      })),
     });
 
     // ===============================
-    // 🤖 7. AGENT EXECUTION
+    // 🔒 7. GOVERNANCE APPROVAL CHECK (STRICT)
     // ===============================
-    await trace.logAgentExecution(decision.id, "start");
+    const approval = await this.evolutionRegistry.getStatus(decision.id);
+
+    const isBlocked =
+      approval &&
+      approval.status !== "approved";
+
+    if (isBlocked) {
+      await trace.log({
+        type: "agent_blocked_pending_approval",
+        agent: decision.id,
+        status: approval.status,
+      });
+
+      return {
+        query,
+        traceId: trace.getTraceId(),
+        status: "blocked_pending_approval",
+        proposed_agent: decision.id,
+      };
+    }
+
+    // ===============================
+    // 🤖 8. AGENT EXECUTION
+    // ===============================
+    await trace.log({
+      type: "agent_execution_start",
+      agent: decision.id,
+      competition_mode: true,
+    });
 
     const result = await executeAgent(
       decision.id,
@@ -110,69 +167,10 @@ export class MCPBrain {
       { trace }
     );
 
-    await trace.logAgentExecution(decision.id, "success");
-
-    // ===============================
-    // 🧠 8. RL FEEDBACK LOOP (AUDITED + SAFE)
-    // ===============================
-
-    const startTime = Date.now();
-
-    let success = true;
-    let confidence = 0.5;
-
-    try {
-      success =
-        typeof result === "object" &&
-        result !== null &&
-        (result.success !== false);
-
-      confidence =
-        typeof decision?.score === "number"
-          ? decision.score
-          : 0.5;
-    } catch (err) {
-      await trace.log({
-        type: "rl_signal_parse_error",
-        error: (err as Error).message,
-      });
-    }
-
-    const durationMs = Date.now() - startTime;
-
-    let rlSignal: any = null;
-
-    try {
-      rlSignal = await this.computeReinforcementSignal({
-        success,
-        durationMs,
-        confidence,
-        agentId: decision.id,
-      });
-    } catch (err) {
-      await trace.log({
-        type: "rl_signal_compute_failed",
-        error: (err as Error).message,
-      });
-    }
-
-    if (rlSignal) {
-      await trace.log({
-        type: "reinforcement_signal",
-        signal: rlSignal,
-      });
-    }
-
-    try {
-      if (rlSignal) {
-        await this.applyReinforcementUpdate(rlSignal);
-      }
-    } catch (err) {
-      await trace.log({
-        type: "rl_memory_update_failed",
-        error: (err as Error).message,
-      });
-    }
+    await trace.log({
+      type: "agent_execution_success",
+      agent: decision.id,
+    });
 
     // ===============================
     // 📊 9. LEARNING PHASE
@@ -185,19 +183,19 @@ export class MCPBrain {
     });
 
     // ===============================
-    // 🔁 10. AUTONOMY ANALYSIS
+    // 🔁 10. AUTONOMY ANALYSIS (SAFE)
     // ===============================
     const autonomySignal = await this.autonomyEngine.analyze(signals);
 
     await trace.log({
       type: "autonomy_signal_generated",
-      signal: autonomySignal?.type || null,
+      signal: autonomySignal?.type ?? null,
     });
 
     // ===============================
-    // 🧠 11. GOVERNED MEMORY UPDATE
+    // 🧠 11. GOVERNED SYSTEM MEMORY UPDATE
     // ===============================
-    if (autonomySignal) {
+    if (autonomySignal?.type && autonomySignal?.payload) {
       await this.governor.validateSystemChange({
         query,
         signal: autonomySignal,
@@ -237,78 +235,28 @@ export class MCPBrain {
         selected_nodes: nodeIds,
       },
 
-      autonomy: autonomySignal || null,
-      reinforcement: rlSignal || null,
+      competition: competition.ranking ?? [],
+
+      autonomy: autonomySignal ?? null,
     };
   }
 
-  // ===============================
-  // 🧠 RL ENGINE (SAFE)
-  // ===============================
-  private async computeReinforcementSignal(params: {
-    success: boolean;
-    durationMs?: number;
-    confidence?: number;
-    agentId: string;
-  }) {
-    const { success, durationMs = 0, confidence = 0.5, agentId } = params;
-
-    let reward = 0;
-
-    reward += success ? 1 : -1;
-    reward += confidence * 0.5;
-
-    if (durationMs > 3000) {
-      reward -= 0.2;
-    }
-
-    reward = Math.max(-1, Math.min(1, reward));
-
-    return {
-      agentId,
-      reward,
-      success,
-      durationMs,
-      confidence,
-      timestamp: new Date().toISOString(),
-    };
-  }
-
-  private async applyReinforcementUpdate(signal: any) {
-    const policy = await getSystemMemory("agent_policy");
-    const agentId = signal.agentId;
-
-    const current = policy?.[agentId] ?? 0.5;
-
-    const updated = current * 0.8 + signal.reward * 0.2;
-
-    await applySystemUpdate("agent_policy", {
-      strategy: "rl_update",
-      agentId,
-      reward: signal.reward,
-      updatedScore: updated,
-    });
-  }
-
-  // ===============================
-  // 🧠 SYSTEM MEMORY UPDATE HANDLER
-  // ===============================
-  private async applySystemMemoryUpdate(
-    signal: any,
-    trace: MCPTraceEngine
-  ) {
+  /**
+   * 🧠 SYSTEM MEMORY UPDATE (GOVERNED)
+   */
+  private async applySystemMemoryUpdate(signal: any, trace: MCPTraceEngine) {
     switch (signal.type) {
       case "vector_weight_increase":
         await applySystemUpdate("vector_weights", {
           bias: "increase",
-          reason: signal.payload.reason,
+          reason: signal.payload?.reason ?? "auto",
         });
         break;
 
       case "agent_bias_adjustment":
         await applySystemUpdate("agent_policy", {
           strategy: "rebalance",
-          reason: signal.payload.reason,
+          reason: signal.payload?.reason ?? "auto",
         });
         break;
 
@@ -324,21 +272,21 @@ export class MCPBrain {
     });
   }
 
-  // ===============================
-  // 🔍 EMBEDDING ENGINE
-  // ===============================
+  /**
+   * 🔍 EMBEDDING ENGINE
+   */
   private async embedQuery(text: string): Promise<number[]> {
     const res = await openai.embeddings.create({
       model: "text-embedding-3-small",
       input: text,
     });
 
-    return res.data[0].embedding;
+    return res.data?.[0]?.embedding ?? [];
   }
 
-  // ===============================
-  // 🔍 VECTOR SEARCH
-  // ===============================
+  /**
+   * 🔍 VECTOR SEARCH
+   */
   private async vectorSearch(queryEmbedding: number[]) {
     const { data, error } = await supabase.rpc("match_nodes", {
       query_embedding: queryEmbedding,
@@ -347,12 +295,12 @@ export class MCPBrain {
     });
 
     if (error) throw error;
-    return data || [];
+    return data ?? [];
   }
 
-  // ===============================
-  // 🕸 GRAPH TRAVERSAL
-  // ===============================
+  /**
+   * 🕸 GRAPH TRAVERSAL
+   */
   private async graphTraversal(nodeIds: string[]) {
     if (!nodeIds.length) return [];
 
@@ -362,6 +310,6 @@ export class MCPBrain {
       .in("from_node_id", nodeIds);
 
     if (error) throw error;
-    return data || [];
+    return data ?? [];
   }
-    }
+        }
