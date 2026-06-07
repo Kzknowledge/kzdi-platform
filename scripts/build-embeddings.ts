@@ -11,29 +11,33 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
 });
 
+/**
+ * CONFIG (tuned for cost + stability)
+ */
 const BATCH_SIZE = 10;
 const MAX_RETRIES = 3;
-const RATE_LIMIT_DELAY = 200; // ms between requests (cost + throttle control)
+const RATE_LIMIT_DELAY = 250;
 
 /**
- * Build MCP embedding text
+ * Build MCP embedding text (stable + deterministic)
  */
 function buildText(node: any): string {
   return [
     node.title,
     node.summary,
     node.category,
-    (node.tags || []).join(","),
+    Array.isArray(node.tags) ? node.tags.join(",") : "",
     node.node_type,
     node.title_hausa,
     node.summary_hausa,
   ]
     .filter(Boolean)
-    .join(" | ");
+    .join(" | ")
+    .trim();
 }
 
 /**
- * Generate embedding with retry logic
+ * Retry-safe embedding generator (only retries transient failures)
  */
 async function generateEmbedding(text: string): Promise<number[]> {
   let lastError: any;
@@ -46,13 +50,24 @@ async function generateEmbedding(text: string): Promise<number[]> {
       });
 
       return res.data[0].embedding;
-    } catch (err) {
+    } catch (err: any) {
       lastError = err;
-      console.warn(`⚠️ Retry ${attempt}/${MAX_RETRIES} failed`);
 
-      await new Promise((r) =>
-        setTimeout(r, 500 * attempt) // exponential backoff
+      const isRateLimit =
+        err?.status === 429 || err?.code === "rate_limit_exceeded";
+
+      const isRetryable = isRateLimit || err?.status >= 500;
+
+      if (!isRetryable) {
+        console.error("❌ Non-retryable embedding error:", err.message);
+        throw err;
+      }
+
+      console.warn(
+        `⚠️ Retry ${attempt}/${MAX_RETRIES} (reason: ${err.message})`
       );
+
+      await sleep(500 * attempt);
     }
   }
 
@@ -60,7 +75,7 @@ async function generateEmbedding(text: string): Promise<number[]> {
 }
 
 /**
- * Fetch only nodes missing embeddings (CRITICAL OPTIMIZATION)
+ * Fetch nodes WITHOUT embeddings (resume-safe)
  */
 async function fetchNodes() {
   const { data, error } = await supabase
@@ -76,7 +91,7 @@ async function fetchNodes() {
 }
 
 /**
- * Update node embedding
+ * Safe partial update (prevents accidental overwrite issues)
  */
 async function updateNode(id: string, embedding: number[]) {
   const { error } = await supabase
@@ -98,26 +113,33 @@ function sleep(ms: number) {
 }
 
 /**
- * Main pipeline
+ * Main pipeline (resilient loop)
  */
 async function run() {
   console.log("🚀 MCP Embedding Pipeline STARTED");
 
   let totalProcessed = 0;
+  let batchCount = 0;
 
   while (true) {
     const nodes = await fetchNodes();
 
-    if (nodes.length === 0) {
+    if (!nodes.length) {
       console.log("✅ ALL NODES EMBEDDED");
       break;
     }
 
-    console.log(`📦 Processing batch: ${nodes.length} nodes`);
+    batchCount++;
+    console.log(`📦 Batch ${batchCount}: ${nodes.length} nodes`);
 
     for (const node of nodes) {
       try {
         const text = buildText(node);
+
+        if (!text) {
+          console.warn(`⚠️ Skipping empty node: ${node.id}`);
+          continue;
+        }
 
         console.log(`🧠 Embedding: ${node.title}`);
 
@@ -127,20 +149,21 @@ async function run() {
 
         totalProcessed++;
 
-        // rate control (cost + API safety)
         await sleep(RATE_LIMIT_DELAY);
-      } catch (err) {
-        console.error(`❌ Failed node ${node.id}`, err);
+      } catch (err: any) {
+        console.error(`❌ Node failed (${node.id}):`, err.message);
+        // continue pipeline (important for production resilience)
+        continue;
       }
     }
 
-    console.log(`📊 Progress: ${totalProcessed} nodes processed`);
+    console.log(`📊 Progress: ${totalProcessed} nodes embedded`);
   }
 
   console.log(`🎉 DONE — Total embedded: ${totalProcessed}`);
 }
 
 run().catch((err) => {
-  console.error("❌ PIPELINE FAILED:", err);
+  console.error("❌ PIPELINE FAILED:", err.message);
   process.exit(1);
 });
