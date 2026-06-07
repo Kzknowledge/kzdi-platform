@@ -1,80 +1,95 @@
-import { getSystemBias } from "./system-memory";
-
-type VectorResult = {
-  id: string;
-  score: number;
-};
+import { getSystemMemory } from "./system-memory";
 
 type Agent = {
   id: string;
-  alias: string;
-  capabilities: string[];
-  mcp_layer: string;
+  alias?: string;
+  mcp_layer?: string;
+  capabilities?: string[];
 };
 
 export class MCPDecisionEngine {
   /**
-   * MEMORY-AWARE AGENT SELECTION ENGINE
+   * 🧠 REINFORCEMENT-AWARE AGENT SELECTION
    */
   async selectAgent(input: {
     query: string;
-    vectorResults: VectorResult[];
+    vectorResults: any[];
     graphNodes: string[];
     agents: Agent[];
   }) {
     const { vectorResults, graphNodes, agents } = input;
 
-    // 🧠 STEP 1: LOAD SYSTEM MEMORY BIAS
-    const memory = await getSystemBias();
+    // ===============================
+    // 1. LOAD REINFORCEMENT WEIGHTS
+    // ===============================
+    const memory = await getSystemMemory("reinforcement_weights");
 
-    const vectorWeight =
-      memory?.vectorWeights?.bias === "increase" ? 0.6 : 0.4;
+    const agentBiasMap: Record<string, number> =
+      memory?.agent_bias_map || {};
 
-    const agentPolicy = memory?.agentPolicy || {};
+    const vectorBias = memory?.vector_bias || 1.0;
+    const graphBias = memory?.graph_bias || 1.0;
 
-    let bestAgent: any = agents[0];
+    // ===============================
+    // 2. COMPETITION SCORING
+    // ===============================
+    let best: Agent = agents[0];
     let bestScore = -Infinity;
 
-    // 🧠 STEP 2: SCORE EACH AGENT
+    const ranking: any[] = [];
+
     for (const agent of agents) {
-      let score = 0;
-
-      // 🔷 VECTOR SIGNAL CONTRIBUTION
+      // base signals
       const vectorScore =
-        vectorResults.reduce((s, v) => s + v.score, 0) *
-        vectorWeight;
+        vectorResults.reduce((s, v) => s + (v.score || 0), 0) *
+        vectorBias;
 
-      score += vectorScore;
+      const graphScore = graphNodes.length * graphBias;
 
-      // 🔷 GRAPH SIGNAL CONTRIBUTION
-      score += graphNodes.length * 0.2;
+      const capabilityBonus = agent.capabilities?.includes(
+        "ai_evaluation_0_100"
+      )
+        ? 0.3
+        : 0;
 
-      // 🔷 CAPABILITY BOOST
-      if (agent.capabilities?.includes("ai_evaluation_0_100")) {
-        score += 0.3;
-      }
+      const agentBias = agentBiasMap[agent.id] || 1.0;
 
-      if (agent.capabilities?.includes("infrastructure_monitoring")) {
-        score += 0.2;
-      }
+      // ===============================
+      // FINAL SCORE MODEL (REINFORCED)
+      // ===============================
+      const score =
+        (vectorScore + graphScore + capabilityBonus) *
+        agentBias;
 
-      // 🧠 STEP 3: MEMORY-BASED AGENT BIAS
-      const historicalBias = agentPolicy?.[agent.id] || 0.5;
-      score += historicalBias * 0.4;
+      ranking.push({
+        agent,
+        score,
+      });
 
-      // 🔷 TRACK BEST AGENT
       if (score > bestScore) {
         bestScore = score;
-        bestAgent = agent;
+        best = agent;
       }
     }
 
-    // 🧠 STEP 4: RETURN ENHANCED DECISION
+    // ===============================
+    // 3. NORMALIZE RANKING
+    // ===============================
+    ranking.sort((a, b) => b.score - a.score);
+
+    // ===============================
+    // 4. OUTPUT
+    // ===============================
     return {
-      ...bestAgent,
+      id: best.id,
+      alias: best.alias,
+      mcp_layer: best.mcp_layer,
       score: bestScore,
+
+      ranking,
+
       memoryInfluenced: true,
-      vectorWeightUsed: vectorWeight,
+      reinforcement_applied: true,
     };
   }
 }
