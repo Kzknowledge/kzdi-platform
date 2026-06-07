@@ -2,10 +2,66 @@ import express from "express";
 import { getSystemStatus } from "./config/system";
 import { MCPTraceEngine } from "./config/system/trace";
 import { executeAgent } from "./agents/registry";
+import { createClient } from "@supabase/supabase-js";
+import OpenAI from "openai";
 
 const app = express();
-
 app.use(express.json());
+
+/**
+ * INFRA INIT
+ */
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY!,
+});
+
+/**
+ * EMBEDDING (QUERY TIME)
+ */
+async function embedQuery(text: string): Promise<number[]> {
+  const res = await openai.embeddings.create({
+    model: "text-embedding-3-small",
+    input: text,
+  });
+
+  return res.data[0].embedding;
+}
+
+/**
+ * VECTOR SEARCH (REAL pgvector)
+ */
+async function vectorSearch(queryEmbedding: number[]) {
+  const { data, error } = await supabase.rpc("match_nodes", {
+    query_embedding: queryEmbedding,
+    match_threshold: 0.7,
+    match_count: 5,
+  });
+
+  if (error) throw error;
+
+  return data || [];
+}
+
+/**
+ * GRAPH EXPANSION (REAL edges table)
+ */
+async function graphTraversal(nodeIds: string[]) {
+  if (!nodeIds.length) return [];
+
+  const { data, error } = await supabase
+    .from("edges")
+    .select("from_node_id, to_node_id, label, strength")
+    .in("from_node_id", nodeIds);
+
+  if (error) throw error;
+
+  return data || [];
+}
 
 /**
  * HEALTH ENDPOINT
@@ -16,7 +72,7 @@ app.get("/api/health", async (_req, res) => {
 });
 
 /**
- * MCP QUERY ENTRY POINT (FULL TRACE + GRAPH + VECTOR + AGENT BINDING)
+ * MCP QUERY ENTRY POINT (FULL BRAIN PIPELINE)
  */
 app.post("/api/query", async (req, res) => {
   const trace = new MCPTraceEngine();
@@ -25,99 +81,97 @@ app.post("/api/query", async (req, res) => {
     const { query } = req.body;
 
     if (!query) {
-      await trace.logRequestFailed("Query is required");
+      await trace.log({ type: "request_failed", reason: "missing_query" });
 
       return res.status(400).json({
         error: "Query is required",
-        traceId: trace.getTraceId()
+        traceId: trace.getTraceId(),
       });
     }
 
-    // 🔷 STEP 1: REQUEST RECEIVED
-    await trace.logRequestReceived(query);
+    // 🔷 STEP 1: TRACE INPUT
+    await trace.log({ type: "query_received", query });
 
-    // 🔷 STEP 2: VECTOR SEARCH (SIMULATED LAYER - replace with pgvector later)
-    const vectorResults = [
-      { id: "node_hausa_nlp", score: 0.94 },
-      { id: "node_mcp_core", score: 0.89 },
-      { id: "node_ai_agents", score: 0.83 }
-    ];
+    // 🔷 STEP 2: EMBED QUERY
+    const queryEmbedding = await embedQuery(query);
 
-    await trace.logVectorSearch(query, vectorResults);
+    // 🔷 STEP 3: VECTOR SEARCH (REAL MCP MEMORY)
+    const vectorResults = await vectorSearch(queryEmbedding);
 
-    const nodeIds = vectorResults.map(v => v.id);
+    await trace.logVectorSearch(query, vectorResults.length);
 
-    // 🔷 STEP 3: GRAPH TRAVERSAL (SIMULATED STRUCTURE)
-    const graphEdges = [
-      { from: "node_hausa_nlp", to: "node_mcp_core", label: "depends_on" },
-      { from: "node_mcp_core", to: "node_ai_agents", label: "orchestrates" }
-    ];
+    const nodeIds = vectorResults.map((v: any) => v.id);
 
-    await trace.logGraphTraversal(nodeIds, graphEdges);
+    // 🔷 STEP 4: GRAPH EXPANSION (REAL RELATIONSHIPS)
+    const graphEdges = await graphTraversal(nodeIds);
 
-    // 🔷 STEP 4: AGENT EXECUTION (TRACE-AWARE)
-    await trace.logAgentExecution("KZDI-CORE-AGENT-01", "start");
+    await trace.logGraphTraversal(nodeIds);
 
+    // 🔷 STEP 5: AGENT SELECTION (LIGHTWEIGHT RULE LAYER FOR NOW)
+    const selectedAgentId = "KZDI-CORE-AGENT-01";
+
+    await trace.logAgentExecution(selectedAgentId, "start");
+
+    // 🔷 STEP 6: AGENT EXECUTION
     const agentResult = await executeAgent(
-      "KZDI-CORE-AGENT-01",
+      selectedAgentId,
       {
         query,
-        context_nodes: nodeIds,
+        vector_results: vectorResults,
         graph_edges: graphEdges,
-        vector_results: vectorResults
       },
       { trace }
     );
 
-    await trace.logAgentExecution("KZDI-CORE-AGENT-01", "success");
+    await trace.logAgentExecution(selectedAgentId, "success");
 
-    // 🔷 STEP 5: RESPONSE BUILD (EXPLAINABLE OUTPUT)
+    // 🔷 STEP 7: RESPONSE BUILD
     const response = {
       query,
-      answer: "MCP fully executed with graph + vector + agent binding",
       traceId: trace.getTraceId(),
 
-      // 🧠 AI execution transparency
-      reasoning: {
-        selected_nodes: nodeIds,
-        vector_hits: vectorResults,
-        graph_path: graphEdges,
-        agent_used: agentResult.alias
+      result: {
+        answer: "MCP execution completed with vector + graph + agent binding",
+        agent: agentResult,
       },
 
-      agent: agentResult,
-      timestamp: new Date().toISOString()
+      reasoning: {
+        vector_hits: vectorResults,
+        graph_edges: graphEdges,
+        selected_nodes: nodeIds,
+      },
+
+      timestamp: new Date().toISOString(),
     };
 
-    // 🔷 STEP 6: FINISH TRACE
+    // 🔷 STEP 8: FINISH TRACE
     await trace.finish("success");
 
     return res.json(response);
-
   } catch (err: any) {
-    await trace.logRequestFailed(err.message);
+    await trace.log({ type: "system_error", error: err.message });
     await trace.finish("failed");
 
     return res.status(500).json({
       error: err.message || "Internal server error",
-      traceId: trace.getTraceId()
+      traceId: trace.getTraceId(),
     });
   }
 });
 
 /**
- * ROOT ENDPOINT
+ * ROOT
  */
 app.get("/", (_req, res) => {
   res.json({
     service: "KZDI MCP Platform",
     status: "running",
-    version: "1.0.0"
+    architecture: "vector + graph + agent + trace",
   });
 });
 
 /**
- * SERVER START
+ * START SERVER
  */
 const PORT = process.env.PORT || 3000;
 
