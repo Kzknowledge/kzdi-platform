@@ -5,100 +5,162 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-const LOCK_TTL_MS = 5 * 60 * 1000; // 5 minutes safety timeout
+const LOCK_TTL_MS = 5 * 60 * 1000; // 5 minutes safety window
 
-type LockKey =
+type LockJob =
   | "reinforcement"
   | "competition"
   | "evolution"
   | "deployment";
 
+function now() {
+  return new Date().toISOString();
+}
+
 /**
- * 🔐 ACQUIRE DISTRIBUTED MCP LOCK
- * Prevents concurrent loop execution across GitHub Actions runners
+ * 🧠 ACQUIRE DISTRIBUTED LOCK (AUTO-INSTRUMENTED)
  */
-export async function acquireLock(job: LockKey): Promise<boolean> {
-  const key = `mcp_lock:${job}`;
+export async function acquireLock(job: LockJob): Promise<boolean> {
+  const lockKey = `mcp_lock:${job}`;
+  const start = Date.now();
 
-  // 1. Fetch existing lock
-  const { data } = await supabase
-    .from("system_memory")
-    .select("value, updated_at")
-    .eq("key", key)
-    .single();
+  try {
+    // 1. Check current lock state
+    const { data } = await supabase
+      .from("system_memory")
+      .select("value")
+      .eq("key", lockKey)
+      .single();
 
-  const now = Date.now();
+    const existing = data?.value;
 
-  // 2. Check if lock exists and is still active
-  if (data?.value?.active) {
-    const startedAt = new Date(
-      data?.value?.started_at || 0
-    ).getTime();
+    // 2. Stale lock detection
+    if (existing?.active) {
+      const age = Date.now() - new Date(existing.started_at).getTime();
 
-    // stale lock recovery
-    if (now - startedAt < LOCK_TTL_MS) {
-      console.log(`⛔ Lock active for ${job}`);
-      return false;
+      if (age < LOCK_TTL_MS) {
+        await logEvent(job, "failed", {
+          reason: "lock_active",
+          age_ms: age,
+        });
+
+        return false;
+      }
+
+      // stale recovery
+      await logEvent(job, "stale", {
+        reason: "ttl_expired",
+        age_ms: age,
+      });
     }
 
-    console.log(`🧹 Stale lock cleared for ${job}`);
-  }
+    // 3. Acquire lock
+    await supabase.from("system_memory").upsert({
+      key: lockKey,
+      value: {
+        active: true,
+        job,
+        started_at: now(),
+      },
+      updated_at: now(),
+    });
 
-  // 3. Acquire lock
-  const { error } = await supabase.from("system_memory").upsert({
-    key,
-    value: {
-      active: true,
-      job,
-      started_at: new Date().toISOString(),
-    },
-    updated_at: new Date().toISOString(),
-  });
+    await logEvent(job, "acquired", {
+      latency_ms: Date.now() - start,
+    });
 
-  if (error) {
-    console.error("❌ Lock acquisition failed:", error);
+    return true;
+  } catch (err: any) {
+    await logEvent(job, "failed", {
+      error: err?.message || "unknown_error",
+    });
+
     return false;
   }
-
-  return true;
 }
 
 /**
- * 🔓 RELEASE MCP LOCK
+ * 🧠 RELEASE LOCK (AUTO-INSTRUMENTED)
  */
-export async function releaseLock(job: LockKey): Promise<void> {
-  const key = `mcp_lock:${job}`;
+export async function releaseLock(job: LockJob): Promise<void> {
+  const lockKey = `mcp_lock:${job}`;
+  const start = Date.now();
 
-  const { error } = await supabase.from("system_memory").upsert({
-    key,
-    value: {
-      active: false,
-      job,
-      released_at: new Date().toISOString(),
-    },
-    updated_at: new Date().toISOString(),
-  });
+  try {
+    const { data } = await supabase
+      .from("system_memory")
+      .select("value")
+      .eq("key", lockKey)
+      .single();
 
-  if (error) {
-    console.error("❌ Lock release failed:", error);
+    const startedAt = data?.value?.started_at
+      ? new Date(data.value.started_at).getTime()
+      : Date.now();
+
+    const duration = Date.now() - startedAt;
+
+    await supabase.from("system_memory").upsert({
+      key: lockKey,
+      value: {
+        active: false,
+        job,
+        released_at: now(),
+      },
+      updated_at: now(),
+    });
+
+    await logEvent(job, "released", {
+      duration_ms: duration,
+      latency_ms: Date.now() - start,
+    });
+  } catch (err: any) {
+    await logEvent(job, "failed", {
+      stage: "release",
+      error: err?.message || "unknown_error",
+    });
   }
 }
 
 /**
- * 🧠 FORCE CLEAR LOCK (EMERGENCY USE ONLY)
+ * 🧠 FORCE CLEAR LOCK (EMERGENCY RECOVERY)
  */
-export async function forceClearLock(job: LockKey): Promise<void> {
-  const key = `mcp_lock:${job}`;
+export async function forceClearLock(job: LockJob): Promise<void> {
+  const lockKey = `mcp_lock:${job}`;
 
   await supabase.from("system_memory").upsert({
-    key,
+    key: lockKey,
     value: {
       active: false,
       force_cleared: true,
-      cleared_at: new Date().toISOString(),
+      cleared_at: now(),
     },
-    updated_at: new Date().toISOString(),
+    updated_at: now(),
   });
 
-  console.log(`🧠 Force cleared lock: ${job}`);
+  await logEvent(job, "stale", {
+    reason: "force_cleared",
+  });
+}
+
+/**
+ * 📊 CENTRALIZED EVENT LOGGER
+ */
+async function logEvent(
+  job: LockJob,
+  event_type: "acquired" | "released" | "failed" | "stale",
+  metadata: Record<string, any> = {}
+) {
+  try {
+    await supabase.from("lock_events").insert({
+      job,
+      event_type,
+      metadata: {
+        ...metadata,
+        timestamp: now(),
+      },
+    });
+  } catch (err) {
+    // NEVER break system flow because of logging failure
+    console.error("lock_events log failed:", err);
+  }
 }
