@@ -1,0 +1,89 @@
+import "dotenv/config";
+
+import { runRLScheduler } from "../schedulers/rlScheduler";
+import { runCompetition } from "../agents/multiAgentCompetition";
+import { runEvolutionEngine } from "../agents/agentEvolutionEngine";
+import { acquireLock, releaseLock } from "../utils/lock";
+
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
+
+/**
+ * 🧠 FETCH SYSTEM STATE
+ */
+async function getSystemState() {
+  const { data } = await supabase
+    .from("system_memory")
+    .select("*")
+    .eq("key", "reinforcement_weights")
+    .single();
+
+  return data?.value || {};
+}
+
+/**
+ * 🔁 MAIN RL CYCLE ORCHESTRATOR
+ */
+export async function runRLEcosystem() {
+  console.log("🚀 FULL RL ECOSYSTEM START");
+
+  // 🔐 GLOBAL LOCK (prevents double execution)
+  const locked = await acquireLock("reinforcement");
+
+  if (!locked) {
+    console.log("⛔ RL Ecosystem already running");
+    return;
+  }
+
+  try {
+    // 1. Read system state
+    const state = await getSystemState();
+
+    console.log("📊 Current RL state:", state);
+
+    // 2. Scheduler decides timing pressure
+    await runRLScheduler();
+
+    // 3. Competition phase (agents fight)
+    const winner = await runCompetition();
+
+    console.log("🏆 Competition winner:", winner.agent_id);
+
+    // 4. Evolution phase (population update)
+    await runEvolutionEngine();
+
+    // 5. Feedback injection (IMPORTANT)
+    await supabase.from("system_memory").upsert({
+      key: "rl_feedback_state",
+      value: {
+        last_winner: winner.agent_id,
+        stability_boost: winner.score,
+        updated_at: new Date().toISOString(),
+      },
+    });
+
+    // 6. Telemetry log
+    await supabase.from("telemetry_events").insert({
+      event_type: "rl_ecosystem_cycle",
+      event_data: {
+        winner: winner.agent_id,
+        timestamp: new Date().toISOString(),
+      },
+    });
+
+    console.log("✅ RL Ecosystem cycle complete");
+  } catch (err: any) {
+    console.error("❌ RL Ecosystem error:", err);
+  } finally {
+    await releaseLock("reinforcement");
+  }
+}
+
+/**
+ * 🚀 EXECUTE
+ */
+runRLEcosystem();
