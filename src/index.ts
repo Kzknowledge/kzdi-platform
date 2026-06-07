@@ -1,5 +1,7 @@
 import express from "express";
 import { getSystemStatus } from "./config/system";
+import { MCPTraceEngine } from "./config/system/trace";
+import { executeAgent } from "./agents/registry";
 
 const app = express();
 
@@ -18,31 +20,71 @@ app.get("/api/health", async (_req, res) => {
 
 /**
  * MCP QUERY ENTRY POINT (CORE SYSTEM ROUTE)
- * This is where agents + graph + vector + trace engine will connect
+ * FULL TRACE + AGENT INTEGRATION PIPELINE
  */
 app.post("/api/query", async (req, res) => {
+  const trace = new MCPTraceEngine();
+
   try {
     const { query } = req.body;
 
     if (!query) {
-      return res.status(400).json({
+      await trace.log({
+        type: "invalid_request",
         error: "Query is required"
+      });
+
+      return res.status(400).json({
+        error: "Query is required",
+        traceId: trace.getTraceId()
       });
     }
 
-    // Placeholder MCP response layer (you will connect trace engine here next step)
+    // 🔷 STEP 1: Request received
+    await trace.log({
+      type: "request_received",
+      query
+    });
+
+    // 🔷 STEP 2: Agent execution (core routing agent)
+    const agentResult = await executeAgent(
+      "KZDI-CORE-AGENT-01",
+      { query },
+      { trace } // 👈 FULL TRACE INTEGRATION
+    );
+
+    await trace.log({
+      type: "agent_execution_completed",
+      agent: agentResult.agent
+    });
+
+    // 🔷 STEP 3: Response construction
     const response = {
       query,
-      answer: "MCP system running (placeholder response)",
-      status: "ok",
+      answer: "MCP execution completed via agent pipeline",
+      agent: agentResult,
+      traceId: trace.getTraceId(),
       timestamp: new Date().toISOString()
     };
+
+    // 🔷 STEP 4: Finish trace
+    await trace.finish("success");
 
     return res.json(response);
 
   } catch (err: any) {
+
+    // 🔴 TRACE FAILURE
+    await trace.log({
+      type: "request_failed",
+      error: err.message
+    });
+
+    await trace.finish("failed");
+
     return res.status(500).json({
-      error: err.message || "Internal server error"
+      error: err.message || "Internal server error",
+      traceId: trace.getTraceId()
     });
   }
 });
