@@ -6,115 +6,95 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-type ReinforcementState = {
+type RLState = {
   vector_bias: number;
   graph_bias: number;
-  agent_bias_map: Record<string, number>;
+  agent_policy: Record<string, number>;
   signal_history: any[];
   stability_score: number;
   updated_at?: string;
 };
 
-function clamp(v: number, min = 0.5, max = 1.5) {
-  return Math.max(min, Math.min(max, v));
+const ALPHA = 0.25; // EMA smoothing factor
+const CLAMP_MIN = 0.5;
+const CLAMP_MAX = 1.5;
+
+function clamp(v: number) {
+  return Math.max(CLAMP_MIN, Math.min(CLAMP_MAX, v));
 }
 
 /**
- * 🧠 MCP REINFORCEMENT LOOP (FINAL FIXED VERSION)
+ * 🧠 REINFORCEMENT LEARNING ENGINE (RL v2)
  */
-async function runLoop() {
-  console.log("🔁 MCP Reinforcement Loop START");
+async function runRL() {
+  console.log("🔁 MCP RL ENGINE START");
 
   // ===============================
   // 1. LOAD TELEMETRY
   // ===============================
-  const { data: signals, error: sigErr } = await supabase
+  const { data: signals } = await supabase
     .from("telemetry_events")
     .select("*")
-    .gte(
-      "created_at",
-      new Date(Date.now() - 60 * 60 * 1000).toISOString()
-    );
-
-  if (sigErr) {
-    console.error("❌ Telemetry fetch failed", sigErr);
-    return;
-  }
+    .gte("created_at", new Date(Date.now() - 60 * 60 * 1000).toISOString());
 
   console.log("📊 Signals loaded:", signals?.length ?? 0);
 
   // ===============================
-  // 2. LOAD MEMORY (SAFE PARSE)
+  // 2. LOAD MEMORY STATE
   // ===============================
-  const { data: memoryRow, error: memErr } = await supabase
+  const { data: memoryRow } = await supabase
     .from("system_memory")
     .select("value")
     .eq("key", "reinforcement_weights")
     .single();
 
-  if (memErr) {
-    console.error("❌ Memory load error:", memErr);
-  }
-
-  const previous: ReinforcementState =
-    memoryRow?.value &&
-    typeof memoryRow.value === "object"
-      ? (memoryRow.value as ReinforcementState)
-      : {
-          vector_bias: 1,
-          graph_bias: 1,
-          agent_bias_map: {},
-          signal_history: [],
-          stability_score: 1,
-        };
-
-  // ===============================
-  // 3. COMPUTE SIGNAL METRICS
-  // ===============================
-  const successCount =
-    signals?.filter((s) => s.event_data?.success === true).length ?? 0;
-
-  const successRate =
-    signals?.length > 0 ? successCount / signals.length : 0.5;
-
-  // ===============================
-  // 4. UPDATE BIASES
-  // ===============================
-  let vector_bias = previous.vector_bias;
-  let graph_bias = previous.graph_bias;
-
-  if (successRate > 0.7) vector_bias += 0.05;
-  if (successRate < 0.5) vector_bias -= 0.05;
-
-  vector_bias = clamp(vector_bias);
-  graph_bias = clamp(graph_bias);
-
-  const stability_score = clamp(1 - Math.abs(successRate - 0.5), 0, 1);
-
-  // ===============================
-  // 5. BUILD NEW SIGNAL
-  // ===============================
-  const newSignal = {
-    timestamp: new Date().toISOString(),
-    successRate,
-    vector_bias,
-    graph_bias,
-    stability_score,
+  const prev: RLState = memoryRow?.value ?? {
+    vector_bias: 1,
+    graph_bias: 1,
+    agent_policy: {},
+    signal_history: [],
+    stability_score: 1,
   };
 
   // ===============================
-  // 6. MERGE HISTORY (CRITICAL FIX)
+  // 3. COMPUTE REWARD SIGNAL
   // ===============================
-  const signal_history = [
-    ...(previous.signal_history ?? []).slice(-9),
-    newSignal,
-  ];
+  const successRate =
+    (signals?.filter((s) => s.event_data?.success).length ?? 0) /
+    (signals?.length || 1);
+
+  const avgLatency =
+    signals?.reduce((a, b) => a + (b.event_data?.latency || 500), 0) /
+    (signals?.length || 1);
+
+  const confidence = 1 - Math.abs(successRate - 0.5);
+
+  // FINAL REWARD FUNCTION (CORE RL SIGNAL)
+  const reward =
+    successRate * 0.5 +
+    confidence * 0.3 +
+    (avgLatency < 500 ? 0.2 : -0.2);
 
   // ===============================
-  // 7. UPDATE AGENT BIAS MAP
+  // 4. EMA UPDATE (SMOOTHING)
   // ===============================
-  const agent_bias_map: Record<string, number> = {
-    ...(previous.agent_bias_map ?? {}),
+  const vector_bias = clamp(
+    prev.vector_bias + ALPHA * (reward - 0.5)
+  );
+
+  const graph_bias = clamp(
+    prev.graph_bias + ALPHA * (0.5 - reward)
+  );
+
+  const stability_score = clamp(
+    1 - Math.abs(reward - 0.5)
+  );
+
+  // ===============================
+  // 5. AGENT POLICY LEARNING (RL CORE)
+  // ===============================
+  const agent_policy: Record<string, number> = {
+    ...prev.agent_policy,
   };
 
   for (const s of signals ?? []) {
@@ -122,54 +102,74 @@ async function runLoop() {
     if (!agent) continue;
 
     const success = s.event_data?.success ? 1 : 0;
+    const latency = s.event_data?.latency || 500;
 
-    agent_bias_map[agent] = clamp(
-      (agent_bias_map[agent] ?? 1) * (success ? 1.02 : 0.98)
+    const agent_reward =
+      success * 0.6 + (latency < 500 ? 0.4 : -0.2);
+
+    const prevVal = agent_policy[agent] ?? 1;
+
+    // EMA policy update (TRUE RL behavior)
+    agent_policy[agent] = clamp(
+      prevVal + ALPHA * (agent_reward - 0.5)
     );
   }
 
   // ===============================
-  // 8. FINAL MERGED STATE
+  // 6. SIGNAL HISTORY (ROLLING MEMORY)
   // ===============================
-  const merged: ReinforcementState = {
+  const signal_history = [
+    ...(prev.signal_history ?? []).slice(-9),
+    {
+      reward,
+      successRate,
+      vector_bias,
+      graph_bias,
+      stability_score,
+      timestamp: new Date().toISOString(),
+    },
+  ];
+
+  // ===============================
+  // 7. FINAL STATE
+  // ===============================
+  const next: RLState = {
     vector_bias,
     graph_bias,
-    agent_bias_map,
+    agent_policy,
     signal_history,
     stability_score,
     updated_at: new Date().toISOString(),
   };
 
   // ===============================
-  // 9. PERSIST (UPSERT SAFE)
+  // 8. SAVE STATE
   // ===============================
-  const { error: saveErr } = await supabase.from("system_memory").upsert(
+  const { error } = await supabase.from("system_memory").upsert(
     {
       key: "reinforcement_weights",
-      value: merged,
+      value: next,
       updated_at: new Date().toISOString(),
     },
     { onConflict: "key" }
   );
 
-  if (saveErr) {
-    console.error("❌ Save failed:", saveErr);
+  if (error) {
+    console.error("❌ RL save failed:", error);
     return;
   }
 
   // ===============================
-  // 10. OUTPUT
+  // 9. OUTPUT
   // ===============================
-  console.log("🧠 Computed update:", {
+  console.log("🧠 RL STATE UPDATED:", {
+    reward,
     vector_bias,
     graph_bias,
     stability_score,
-    updated_at: merged.updated_at,
   });
 
-  console.log("✅ Reinforcement update saved");
-  console.log("📦 New state:", merged);
+  console.log("📦 Agent Policy:", agent_policy);
 }
 
-// ===============================
-runLoop().catch(console.error);
+runRL().catch(console.error);
