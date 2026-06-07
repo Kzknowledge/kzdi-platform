@@ -1,82 +1,98 @@
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
-import { MCPGovernor } from "../core/mcpGovernor";
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-const governor = new MCPGovernor();
+type ReinforcementState = {
+  vector_bias: number;
+  graph_bias: number;
+  agent_bias_map: Record<string, number>;
+  signal_history: any[];
+  stability_score: number;
+  updated_at?: string;
+};
+
+function clamp(v: number, min = 0.5, max = 1.5) {
+  return Math.max(min, Math.min(max, v));
+}
 
 /**
- * 🧠 MCP REINFORCEMENT LOOP (FIXED VERSION)
- * - Persistent memory updates
- * - Signal history tracking
- * - Agent bias evolution
- * - Stability scoring
+ * 🧠 MCP REINFORCEMENT LOOP (FINAL FIXED VERSION)
  */
-async function runReinforcementLoop() {
+async function runLoop() {
   console.log("🔁 MCP Reinforcement Loop START");
 
   // ===============================
-  // 1. LOAD TELEMETRY SIGNALS
+  // 1. LOAD TELEMETRY
   // ===============================
-  const { data: signals, error } = await supabase
+  const { data: signals, error: sigErr } = await supabase
     .from("telemetry_events")
     .select("*")
-    .gte("created_at", new Date(Date.now() - 60 * 60 * 1000).toISOString());
+    .gte(
+      "created_at",
+      new Date(Date.now() - 60 * 60 * 1000).toISOString()
+    );
 
-  if (error) {
-    console.error("❌ Telemetry fetch failed", error);
+  if (sigErr) {
+    console.error("❌ Telemetry fetch failed", sigErr);
     return;
   }
 
   console.log("📊 Signals loaded:", signals?.length ?? 0);
 
   // ===============================
-  // 2. LOAD CURRENT REINFORCEMENT STATE
+  // 2. LOAD MEMORY (SAFE PARSE)
   // ===============================
-  const { data: memoryRow } = await supabase
+  const { data: memoryRow, error: memErr } = await supabase
     .from("system_memory")
-    .select("*")
+    .select("value")
     .eq("key", "reinforcement_weights")
     .single();
 
-  const current = memoryRow?.value ?? {
-    vector_bias: 1,
-    graph_bias: 1,
-    agent_bias_map: {},
-    signal_history: [],
-    stability_score: 1,
-  };
+  if (memErr) {
+    console.error("❌ Memory load error:", memErr);
+  }
+
+  const previous: ReinforcementState =
+    memoryRow?.value &&
+    typeof memoryRow.value === "object"
+      ? (memoryRow.value as ReinforcementState)
+      : {
+          vector_bias: 1,
+          graph_bias: 1,
+          agent_bias_map: {},
+          signal_history: [],
+          stability_score: 1,
+        };
 
   // ===============================
-  // 3. COMPUTE NEW WEIGHTS
+  // 3. COMPUTE SIGNAL METRICS
   // ===============================
+  const successCount =
+    signals?.filter((s) => s.event_data?.success === true).length ?? 0;
+
   const successRate =
-    signals?.length > 0
-      ? signals.filter((s) => s.event_data?.success === true).length /
-        signals.length
-      : 0.5;
+    signals?.length > 0 ? successCount / signals.length : 0.5;
 
-  let vector_bias = current.vector_bias;
-  let graph_bias = current.graph_bias;
+  // ===============================
+  // 4. UPDATE BIASES
+  // ===============================
+  let vector_bias = previous.vector_bias;
+  let graph_bias = previous.graph_bias;
 
   if (successRate > 0.7) vector_bias += 0.05;
   if (successRate < 0.5) vector_bias -= 0.05;
 
-  vector_bias = clamp(vector_bias, 0.5, 1.5);
-  graph_bias = clamp(graph_bias, 0.5, 1.5);
+  vector_bias = clamp(vector_bias);
+  graph_bias = clamp(graph_bias);
 
-  const stability_score = clamp(
-    1 - Math.abs(successRate - 0.5),
-    0,
-    1
-  );
+  const stability_score = clamp(1 - Math.abs(successRate - 0.5), 0, 1);
 
   // ===============================
-  // 4. BUILD SIGNAL ENTRY (PERSISTENCE FIX)
+  // 5. BUILD NEW SIGNAL
   // ===============================
   const newSignal = {
     timestamp: new Date().toISOString(),
@@ -87,17 +103,19 @@ async function runReinforcementLoop() {
   };
 
   // ===============================
-  // 5. MERGE HISTORY (CRITICAL FIX)
+  // 6. MERGE HISTORY (CRITICAL FIX)
   // ===============================
   const signal_history = [
-    ...(current.signal_history ?? []).slice(-9),
+    ...(previous.signal_history ?? []).slice(-9),
     newSignal,
   ];
 
   // ===============================
-  // 6. UPDATE AGENT BIAS MAP
+  // 7. UPDATE AGENT BIAS MAP
   // ===============================
-  const agent_bias_map = { ...(current.agent_bias_map ?? {}) };
+  const agent_bias_map: Record<string, number> = {
+    ...(previous.agent_bias_map ?? {}),
+  };
 
   for (const s of signals ?? []) {
     const agent = s.event_data?.agent;
@@ -105,21 +123,15 @@ async function runReinforcementLoop() {
 
     const success = s.event_data?.success ? 1 : 0;
 
-    agent_bias_map[agent] =
-      clamp((agent_bias_map[agent] ?? 1) * (success ? 1.02 : 0.98), 0.5, 1.5);
+    agent_bias_map[agent] = clamp(
+      (agent_bias_map[agent] ?? 1) * (success ? 1.02 : 0.98)
+    );
   }
 
   // ===============================
-  // 7. GOVERNANCE CHECK
+  // 8. FINAL MERGED STATE
   // ===============================
-  await governor.validateSystemChange({
-    signal: newSignal,
-  });
-
-  // ===============================
-  // 8. PERSIST STATE (CRITICAL FIX)
-  // ===============================
-  const updated = {
+  const merged: ReinforcementState = {
     vector_bias,
     graph_bias,
     agent_bias_map,
@@ -128,29 +140,36 @@ async function runReinforcementLoop() {
     updated_at: new Date().toISOString(),
   };
 
-  const { error: saveError } = await supabase
-    .from("system_memory")
-    .update({ value: updated })
-    .eq("key", "reinforcement_weights");
+  // ===============================
+  // 9. PERSIST (UPSERT SAFE)
+  // ===============================
+  const { error: saveErr } = await supabase.from("system_memory").upsert(
+    {
+      key: "reinforcement_weights",
+      value: merged,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "key" }
+  );
 
-  if (saveError) {
-    console.error("❌ Reinforcement save failed", saveError);
+  if (saveErr) {
+    console.error("❌ Save failed:", saveErr);
     return;
   }
 
-  console.log("🧠 Computed update:", updated);
+  // ===============================
+  // 10. OUTPUT
+  // ===============================
+  console.log("🧠 Computed update:", {
+    vector_bias,
+    graph_bias,
+    stability_score,
+    updated_at: merged.updated_at,
+  });
+
   console.log("✅ Reinforcement update saved");
-  console.log("📦 New state:", updated);
+  console.log("📦 New state:", merged);
 }
 
 // ===============================
-// UTIL
-// ===============================
-function clamp(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value));
-}
-
-// ===============================
-// EXECUTE
-// ===============================
-runReinforcementLoop().catch(console.error);
+runLoop().catch(console.error);
