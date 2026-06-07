@@ -6,6 +6,11 @@ import { MCPGovernor } from "./mcpGovernor";
 import { MCPLearningBrain } from "./learningBrain";
 import { MCPAutonomyEngine } from "./autonomyEngine";
 import { MCPTraceEngine } from "./trace";
+import {
+  getSystemMemory,
+  applySystemUpdate,
+} from "./system-memory";
+
 import { executeAgent, AGENT_REGISTRY } from "../../agents/registry";
 
 const supabase = createClient(
@@ -17,15 +22,6 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
 });
 
-type VectorResult = { id: string; score: number };
-
-type GraphEdge = {
-  from_node_id: string;
-  to_node_id: string;
-  label: string;
-  strength?: number;
-};
-
 export class MCPBrain {
   private decisionEngine = new MCPDecisionEngine();
   private governor = new MCPGovernor();
@@ -33,11 +29,9 @@ export class MCPBrain {
   private autonomyEngine = new MCPAutonomyEngine();
 
   /**
-   * 🧠 SINGLE ENTRY POINT — FULL AUTONOMY EXECUTION
+   * 🧠 SINGLE ENTRY POINT (FULL AUTONOMY LOOP)
    */
-  async run(input: { query: string; trace: MCPTraceEngine }) {
-    const { query, trace } = input;
-
+  async run({ query, trace }: { query: string; trace: MCPTraceEngine }) {
     // 🔒 STEP 1: GOVERNOR PRE-CHECK
     await this.governor.preCheck({ query });
     await trace.log({ type: "governor_precheck_passed" });
@@ -55,8 +49,16 @@ export class MCPBrain {
     const graphEdges = await this.graphTraversal(nodeIds);
     await trace.logGraphTraversal(nodeIds);
 
-    // 🔷 STEP 5: DECISION ENGINE
-    const decision = this.decisionEngine.selectAgent({
+    // 🔷 STEP 5: LOAD SYSTEM MEMORY (IMPORTANT)
+    const systemBias = await getSystemMemory("agent_policy");
+
+    await trace.log({
+      type: "system_memory_loaded",
+      bias: systemBias,
+    });
+
+    // 🔷 STEP 6: DECISION ENGINE (MEMORY-AWARE)
+    const decision = await this.decisionEngine.selectAgent({
       query,
       vectorResults,
       graphNodes: nodeIds,
@@ -67,9 +69,10 @@ export class MCPBrain {
       type: "agent_selected",
       agent: decision.id,
       score: decision.score,
+      memoryInfluenced: decision.memoryInfluenced,
     });
 
-    // 🔷 STEP 6: AGENT EXECUTION
+    // 🔷 STEP 7: AGENT EXECUTION
     await trace.logAgentExecution(decision.id, "start");
 
     const result = await executeAgent(
@@ -85,23 +88,45 @@ export class MCPBrain {
 
     await trace.logAgentExecution(decision.id, "success");
 
-    // 🔷 STEP 7: LEARNING SNAPSHOT
-    const learning = await this.learningBrain.fetchRecentSignals(50);
+    // 🔷 STEP 8: LEARNING ANALYSIS
+    const signals = await this.learningBrain.fetchRecentSignals(50);
 
     await trace.log({
       type: "learning_snapshot",
-      count: learning.length,
+      count: signals.length,
     });
 
-    // 🔷 STEP 8: AUTONOMY ANALYSIS (NO WRITE YET)
-    const autonomySignal = await this.autonomyEngine.analyze?.(learning);
+    // 🔷 STEP 9: AUTONOMY ANALYSIS
+    const autonomySignal = await this.autonomyEngine.analyze(signals);
 
     await trace.log({
-      type: "autonomy_evaluated",
-      hasSignal: !!autonomySignal,
+      type: "autonomy_signal",
+      signal: autonomySignal?.type || null,
     });
 
-    // 🔒 STEP 9: GOVERNOR POST-CHECK
+    // 🔷 STEP 10: GOVERNOR VALIDATION
+    if (autonomySignal) {
+      await this.governor.validateSystemChange({
+        query,
+        signal: autonomySignal,
+      });
+
+      // 🔥 APPLY SYSTEM UPDATE (CONTROLLED)
+      await applySystemUpdate(
+        "system_policy",
+        autonomySignal,
+        {
+          reason: autonomySignal.payload?.reason,
+          source: "autonomy_engine",
+        }
+      );
+
+      await trace.log({
+        type: "system_memory_updated",
+        update: autonomySignal.type,
+      });
+    }
+
     await this.governor.postCheck({
       query,
       agent: decision.id,
@@ -111,12 +136,19 @@ export class MCPBrain {
 
     return {
       query,
+      traceId: trace.getTraceId(),
+
       agent: decision,
       result,
-      vectorResults,
-      graphEdges,
-      learning_snapshot: learning.length,
-      autonomy_signal: autonomySignal || null,
+
+      reasoning: {
+        vector_hits: vectorResults,
+        graph_edges: graphEdges,
+        selected_nodes: nodeIds,
+        memory_bias: systemBias,
+      },
+
+      autonomy: autonomySignal || null,
     };
   }
 
@@ -133,7 +165,7 @@ export class MCPBrain {
   }
 
   /**
-   * 🔍 VECTOR SEARCH (pgvector)
+   * 🔍 VECTOR SEARCH
    */
   private async vectorSearch(queryEmbedding: number[]) {
     const { data, error } = await supabase.rpc("match_nodes", {
@@ -149,7 +181,7 @@ export class MCPBrain {
   /**
    * 🕸 GRAPH TRAVERSAL
    */
-  private async graphTraversal(nodeIds: string[]): Promise<GraphEdge[]> {
+  private async graphTraversal(nodeIds: string[]) {
     if (!nodeIds.length) return [];
 
     const { data, error } = await supabase
