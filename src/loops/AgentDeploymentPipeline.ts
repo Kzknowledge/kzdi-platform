@@ -1,82 +1,46 @@
 import "dotenv/config";
-import "dotenv/config";
-import { acquireLock, releaseLock } from "../utils/lock";
 import { createClient } from "@supabase/supabase-js";
-
-import { AGENT_REGISTRY } from "../agents/registry";
+import { acquireLock, releaseLock } from "../utils/lock";
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-/**
- * 🚀 AGENT DEPLOYMENT PIPELINE
- * Activates approved evolutionary agents into runtime
- */
-async function runDeploymentPipeline() {
-  console.log("🚀 AGENT DEPLOYMENT PIPELINE START");
+export async function runDeploymentPipeline() {
+  const locked = await acquireLock("deployment");
 
-  // ===============================
-  // 1. FETCH APPROVED AGENTS
-  // ===============================
-  const { data: approvedAgents, error } = await supabase
-    .from("evolution_registry")
-    .select("*")
-    .eq("status", "approved");
-
-  if (error) {
-    console.error("❌ Fetch error:", error);
+  if (!locked) {
+    console.log("⛔ Deployment skipped");
     return;
   }
 
-  console.log("📦 Approved agents:", approvedAgents?.length ?? 0);
+  try {
+    console.log("🚀 Deployment Pipeline START");
 
-  // ===============================
-  // 2. DEPLOY NEW AGENTS
-  // ===============================
-  for (const agent of approvedAgents ?? []) {
-    const agentId = agent.new_agent_id;
+    const { data: agents } = await supabase
+      .from("evolution_registry")
+      .select("*")
+      .eq("status", "approved");
 
-    // Prevent duplicates
-    if (AGENT_REGISTRY[agentId]) {
-      continue;
+    for (const agent of agents ?? []) {
+      await supabase
+        .from("evolution_registry")
+        .update({
+          status: "deployed"
+        })
+        .eq("id", agent.id);
+
+      console.log("🟢 Deployed:", agent.new_agent_id);
     }
 
-    // ===============================
-    // 3. CREATE RUNTIME AGENT WRAPPER
-    // ===============================
-    AGENT_REGISTRY[agentId] = {
-      id: agentId,
-      parent: agent.parent,
-      mutation_type: agent.mutation_type,
+    console.log("📦 Deployment complete");
 
-      run: async (input: any) => {
-        return {
-          output: `🧬 Evolved agent ${agentId} executed`,
-          metadata: {
-            expected_bias: agent.expected_bias,
-            origin: agent.parent,
-          },
-        };
-      },
-    };
-
-    console.log("🟢 DEPLOYED AGENT:", agentId);
-
-    // ===============================
-    // 4. MARK AS DEPLOYED
-    // ===============================
-    await supabase
-      .from("evolution_registry")
-      .update({ status: "deployed" })
-      .eq("id", agent.id);
+  } catch (err) {
+    console.error("❌ Deployment error:", err);
+  } finally {
+    await releaseLock();
   }
-
-  // ===============================
-  // 5. SYSTEM STATUS
-  // ===============================
-  console.log("🧠 ACTIVE AGENTS:", Object.keys(AGENT_REGISTRY));
 }
 
-runDeploymentPipeline().catch(console.error);
+runDeploymentPipeline();
