@@ -1,4 +1,10 @@
+import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
+
+/**
+ * MCP REINFORCEMENT LOOP
+ * Runs every 5 minutes via GitHub Actions
+ */
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -6,90 +12,116 @@ const supabase = createClient(
 );
 
 /**
- * MCP REINFORCEMENT CLOSURE LOOP
- * Runs every 5 minutes
+ * Load reinforcement weights safely
  */
-export async function executeReinforcementLoop() {
-  const { data: events } = await supabase
-    .from("telemetry_events")
-    .select("*")
-    .gte("created_at", new Date(Date.now() - 60 * 60 * 1000).toISOString());
-
-  if (!events || events.length === 0) return;
-
-  // -------------------------------
-  // 1. GROUP SIGNALS
-  // -------------------------------
-  const agentStats: Record<string, any> = {};
-
-  for (const e of events) {
-    const agent = e.event_data?.agent_id || "unknown";
-
-    if (!agentStats[agent]) {
-      agentStats[agent] = {
-        success: 0,
-        total: 0,
-        latency: [],
-      };
-    }
-
-    if (e.event_type === "agent_execution_success") {
-      agentStats[agent].success += 1;
-    }
-
-    agentStats[agent].total += 1;
-  }
-
-  // -------------------------------
-  // 2. COMPUTE WEIGHTS
-  // -------------------------------
-  const agent_bias_map: Record<string, number> = {};
-
-  for (const [agent, stats] of Object.entries(agentStats)) {
-    const successRate = stats.success / Math.max(stats.total, 1);
-
-    let bias = 1.0;
-
-    if (successRate > 0.7) bias += 0.1;
-    if (successRate < 0.5) bias -= 0.1;
-
-    bias = Math.max(0.5, Math.min(1.5, bias));
-
-    agent_bias_map[agent] = bias;
-  }
-
-  // -------------------------------
-  // 3. LOAD CURRENT MEMORY
-  // -------------------------------
-  const { data: memory } = await supabase
+async function getWeights() {
+  const { data, error } = await supabase
     .from("system_memory")
     .select("*")
     .eq("key", "reinforcement_weights")
     .single();
 
-  const current = memory?.value || {
-    vector_bias: 1.0,
-    graph_bias: 1.0,
-    agent_bias_map: {},
-    stability_score: 1.0,
-    signal_history: [],
-  };
+  if (error) {
+    console.error("❌ Failed to load reinforcement weights", error);
+    return null;
+  }
 
-  // -------------------------------
-  // 4. UPDATE MEMORY (EMA STYLE)
-  // -------------------------------
-  const updated = {
-    ...current,
-    agent_bias_map,
-    signal_history: (current.signal_history || []).slice(-9),
-    stability_score: 0.85,
+  return data?.value || null;
+}
+
+/**
+ * Fetch recent telemetry signals
+ */
+async function getSignals(limit = 50) {
+  const { data, error } = await supabase
+    .from("telemetry_events")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    console.error("❌ Telemetry fetch failed", error);
+    return [];
+  }
+
+  return data || [];
+}
+
+/**
+ * Compute simple reinforcement update
+ */
+function computeUpdate(signals: any[]) {
+  let successCount = 0;
+
+  for (const s of signals) {
+    if (s.event_type?.includes("success")) {
+      successCount++;
+    }
+  }
+
+  const successRate = signals.length
+    ? successCount / signals.length
+    : 0.5;
+
+  return {
+    vector_bias: 1 + (successRate - 0.5) * 0.2,
+    graph_bias: 1 + (successRate - 0.5) * 0.1,
+    stability_score: Math.min(1, Math.max(0.5, successRate)),
     updated_at: new Date().toISOString(),
   };
+}
 
-  await supabase
+/**
+ * Save updated weights
+ */
+async function saveWeights(updated: any, current: any) {
+  const merged = {
+    ...current,
+    ...updated,
+  };
+
+  const { error } = await supabase
     .from("system_memory")
-    .update({ value: updated })
+    .update({ value: merged })
     .eq("key", "reinforcement_weights");
 
-  console.log("🔁 Reinforcement loop executed");
+  if (error) {
+    console.error("❌ Failed to update weights", error);
+    throw error;
+  }
+
+  return merged;
 }
+
+/**
+ * MAIN LOOP
+ */
+async function run() {
+  console.log("🔁 MCP Reinforcement Loop START");
+
+  try {
+    const current = await getWeights();
+    const signals = await getSignals(50);
+
+    console.log(`📊 Signals loaded: ${signals.length}`);
+
+    if (!current) {
+      console.log("⚠️ No reinforcement weights found");
+      return;
+    }
+
+    const update = computeUpdate(signals);
+
+    console.log("🧠 Computed update:", update);
+
+    const result = await saveWeights(update, current);
+
+    console.log("✅ Reinforcement update saved");
+    console.log("📦 New state:", result);
+  } catch (err) {
+    console.error("❌ Reinforcement loop crashed:", err);
+    process.exit(1);
+  }
+}
+
+run();
