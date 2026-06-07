@@ -2,7 +2,7 @@ name: MCP Reinforcement Loop
 
 on:
   schedule:
-    - cron: "*/5 * * * *"  # every 5 minutes
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -10,19 +10,36 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      # ===============================
+      # NODE SETUP (future-proofed)
+      # ===============================
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: "npm"
 
+      # ===============================
+      # DEPENDENCY INSTALL (LOCKED)
+      # ===============================
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
+      # ===============================
+      # BUILD STEP (CATCH TYPE ERRORS EARLY)
+      # ===============================
+      - name: Build TypeScript
+        run: npm run build
+
+      # ===============================
+      # RUN REINFORCEMENT LOOP
+      # ===============================
       - name: Run Reinforcement Loop
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: npx ts-node src/loops/reinforcementLoop.ts
