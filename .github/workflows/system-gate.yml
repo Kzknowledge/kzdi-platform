@@ -1,0 +1,50 @@
+name: KZDI MCP System Gatekeeper
+
+on:
+  push:
+    branches: [ "main" ]
+
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  validate-system:
+    name: MCP Full System Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout repo
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Setup Node environment
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: npm ci
+
+      # 4. TypeScript build check (catches schema + type issues)
+      - name: TypeScript Build Check
+        run: npm run build
+
+      # 5. Run MCP full system validation (THE CORE GATE)
+      - name: MCP System Validation (CI Gate)
+        run: npm run test:ci
+        env:
+          MCP_API_URL: ${{ secrets.MCP_API_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+
+      # 6. Optional: Jest suite (secondary verification layer)
+      - name: Jest Test Suite
+        run: npm run test:jest
+        continue-on-error: false
+
+      # 7. Final success log
+      - name: System Status
+        run: echo "✅ KZDI MCP SYSTEM PASSED ALL VALIDATION GATES"
