@@ -7,12 +7,15 @@ import OpenAI from "openai";
 import { MCPDecisionEngine } from "./config/system/decisionEngine";
 import { MCPGovernor } from "./config/system/mcpGovernor";
 import { MCPLearningBrain } from "./config/system/learningBrain";
+import { MCPAutonomyEngine } from "./config/system/autonomyEngine";
 
 const app = express();
 app.use(express.json());
 
 /**
- * INFRA INIT
+ * =========================
+ * INFRA INITIALIZATION
+ * =========================
  */
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -26,9 +29,12 @@ const openai = new OpenAI({
 const decisionEngine = new MCPDecisionEngine();
 const mcpGovernor = new MCPGovernor();
 const learningBrain = new MCPLearningBrain();
+const autonomyEngine = new MCPAutonomyEngine();
 
 /**
- * EMBEDDING (QUERY TIME)
+ * =========================
+ * EMBEDDING ENGINE
+ * =========================
  */
 async function embedQuery(text: string): Promise<number[]> {
   const res = await openai.embeddings.create({
@@ -40,7 +46,9 @@ async function embedQuery(text: string): Promise<number[]> {
 }
 
 /**
- * VECTOR SEARCH (pgvector MCP memory)
+ * =========================
+ * VECTOR SEARCH (PGVECTOR)
+ * =========================
  */
 async function vectorSearch(queryEmbedding: number[]) {
   const { data, error } = await supabase.rpc("match_nodes", {
@@ -50,12 +58,13 @@ async function vectorSearch(queryEmbedding: number[]) {
   });
 
   if (error) throw error;
-
   return data || [];
 }
 
 /**
- * GRAPH EXPANSION (edges layer)
+ * =========================
+ * GRAPH TRAVERSAL
+ * =========================
  */
 async function graphTraversal(nodeIds: string[]) {
   if (!nodeIds.length) return [];
@@ -66,12 +75,13 @@ async function graphTraversal(nodeIds: string[]) {
     .in("from_node_id", nodeIds);
 
   if (error) throw error;
-
   return data || [];
 }
 
 /**
+ * =========================
  * HEALTH ENDPOINT
+ * =========================
  */
 app.get("/api/health", async (_req, res) => {
   const status = await getSystemStatus();
@@ -79,7 +89,10 @@ app.get("/api/health", async (_req, res) => {
 });
 
 /**
- * MCP QUERY ENTRY POINT (FULL GOVERNED BRAIN PIPELINE)
+ * =========================
+ * MCP QUERY ENTRY POINT
+ * (FULL GOVERNED AUTONOMOUS BRAIN)
+ * =========================
  */
 app.post("/api/query", async (req, res) => {
   const trace = new MCPTraceEngine();
@@ -97,7 +110,7 @@ app.post("/api/query", async (req, res) => {
     }
 
     // =====================================================
-    // 🔷 STEP 1: GOVERNOR PRE-CHECK (SAFETY GATE #1)
+    // 🔐 STEP 1: GOVERNOR PRE-CHECK
     // =====================================================
     const preCheck = mcpGovernor.validate({ query });
 
@@ -117,33 +130,29 @@ app.post("/api/query", async (req, res) => {
     }
 
     // =====================================================
-    // 🔷 STEP 2: TRACE INPUT
+    // 🧠 STEP 2: TRACE INPUT
     // =====================================================
     await trace.log({ type: "query_received", query });
 
     // =====================================================
-    // 🔷 STEP 3: EMBEDDING
+    // 🧮 STEP 3: VECTOR SEARCH
     // =====================================================
-    const queryEmbedding = await embedQuery(query);
-
-    // =====================================================
-    // 🔷 STEP 4: VECTOR SEARCH
-    // =====================================================
-    const vectorResults = await vectorSearch(queryEmbedding);
+    const embedding = await embedQuery(query);
+    const vectorResults = await vectorSearch(embedding);
 
     await trace.logVectorSearch(query, vectorResults.length);
 
     const nodeIds = vectorResults.map((v: any) => v.id);
 
     // =====================================================
-    // 🔷 STEP 5: GRAPH TRAVERSAL
+    // 🌐 STEP 4: GRAPH EXPANSION
     // =====================================================
     const graphEdges = await graphTraversal(nodeIds);
 
     await trace.logGraphTraversal(nodeIds);
 
     // =====================================================
-    // 🔷 STEP 6: DECISION ENGINE
+    // 🧠 STEP 5: DECISION ENGINE
     // =====================================================
     const decision = decisionEngine.selectAgent({
       query,
@@ -160,7 +169,7 @@ app.post("/api/query", async (req, res) => {
     });
 
     // =====================================================
-    // 🔷 STEP 7: GOVERNOR POST-CHECK (SAFETY GATE #2)
+    // 🔐 STEP 6: GOVERNOR POST-CHECK
     // =====================================================
     const postCheck = mcpGovernor.validate({
       query,
@@ -180,14 +189,14 @@ app.post("/api/query", async (req, res) => {
       await trace.finish("blocked");
 
       return res.status(403).json({
-        error: "Blocked at execution stage by MCP Governor",
+        error: "Blocked at execution stage",
         reason: postCheck.reason,
         traceId: trace.getTraceId(),
       });
     }
 
     // =====================================================
-    // 🔷 STEP 8: AGENT EXECUTION
+    // ⚙️ STEP 7: AGENT EXECUTION
     // =====================================================
     await trace.logAgentExecution(decision.id, "start");
 
@@ -205,27 +214,30 @@ app.post("/api/query", async (req, res) => {
     await trace.logAgentExecution(decision.id, "success");
 
     // =====================================================
-    // 🔷 STEP 9: TRACE COMPLETE
+    // 📡 STEP 8: TRACE COMPLETE
     // =====================================================
     await trace.finish("success");
 
     // =====================================================
-    // 🔷 STEP 10: LEARNING FEEDBACK LOOP
+    // 📊 STEP 9: LEARNING BRAIN UPDATE
     // =====================================================
-    await learningBrain.ingest({
-      traceId: trace.getTraceId(),
-      query,
-      decision,
-      vectorStrength:
-        vectorResults.reduce((s, v) => s + v.score, 0) /
-        Math.max(vectorResults.length, 1),
-      graphStrength: graphEdges.length,
-      confidence: 0.8, // placeholder (can be upgraded later)
-      timestamp: new Date().toISOString(),
+    const learningOutput = await learningBrain.computeAdaptiveWeights();
+
+    const learningGate = mcpGovernor.validateLearningUpdate({
+      agentBias: learningOutput.agentBias,
     });
 
     // =====================================================
-    // 🔷 RESPONSE BUILD
+    // 🧬 STEP 10: AUTONOMY ENGINE (CONTROLLED SELF-UPDATE)
+    // =====================================================
+    await autonomyEngine.runAutonomyCycle({
+      learningOutput,
+      governor: learningGate,
+      traceId: trace.getTraceId(),
+    });
+
+    // =====================================================
+    // 📤 RESPONSE
     // =====================================================
     return res.json({
       query,
@@ -233,7 +245,7 @@ app.post("/api/query", async (req, res) => {
 
       result: {
         answer:
-          "MCP execution completed with governed vector + graph + decision engine binding",
+          "MCP execution completed with full governed autonomous intelligence stack",
         agent: agentResult,
       },
 
@@ -263,18 +275,23 @@ app.post("/api/query", async (req, res) => {
 });
 
 /**
+ * =========================
  * ROOT
+ * =========================
  */
 app.get("/", (_req, res) => {
   res.json({
     service: "KZDI MCP Platform",
     status: "running",
-    architecture: "vector + graph + decision engine + governor + learning + trace",
+    architecture:
+      "vector + graph + decision + governor + learning + autonomy + trace",
   });
 });
 
 /**
+ * =========================
  * SERVER START
+ * =========================
  */
 const PORT = process.env.PORT || 3000;
 
