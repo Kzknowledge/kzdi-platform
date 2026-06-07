@@ -1,195 +1,136 @@
-import { createClient } from "@supabase/supabase-js";
-import OpenAI from "openai";
+async run({ query, trace }: { query: string; trace: MCPTraceEngine }) {
+  // ===============================
+  // 🔒 1. GOVERNOR PRE-CHECK
+  // ===============================
+  await this.governor.preCheck({ query });
+  await trace.log({ type: "governor_precheck_passed" });
 
-import { MCPDecisionEngine } from "./decisionEngine";
-import { MCPGovernor } from "./mcpGovernor";
-import { MCPLearningBrain } from "./learningBrain";
-import { MCPAutonomyEngine } from "./autonomyEngine";
-import { MCPTraceEngine } from "./trace";
-import {
-  getSystemMemory,
-  applySystemUpdate,
-} from "./system-memory";
+  // ===============================
+  // 🧠 2. SYSTEM MEMORY LOAD
+  // ===============================
+  const systemBias = await getSystemMemory("agent_policy");
+  const vectorBias = await getSystemMemory("vector_weights");
 
-import { executeAgent, AGENT_REGISTRY } from "../../agents/registry";
+  await trace.log({
+    type: "system_memory_loaded",
+    systemBias,
+    vectorBias,
+  });
 
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
+  // ===============================
+  // 🔷 3. EMBEDDING + VECTOR SEARCH
+  // ===============================
+  const queryEmbedding = await this.embedQuery(query);
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY!,
-});
+  const vectorResults = await this.vectorSearch(queryEmbedding);
+  await trace.logVectorSearch(query, vectorResults.length);
 
-export class MCPBrain {
-  private decisionEngine = new MCPDecisionEngine();
-  private governor = new MCPGovernor();
-  private learningBrain = new MCPLearningBrain();
-  private autonomyEngine = new MCPAutonomyEngine();
+  const nodeIds = vectorResults.map((v) => v.id);
 
-  /**
-   * 🧠 SINGLE ENTRY POINT (FULL AUTONOMY LOOP)
-   */
-  async run({ query, trace }: { query: string; trace: MCPTraceEngine }) {
-    // 🔒 STEP 1: GOVERNOR PRE-CHECK
-    await this.governor.preCheck({ query });
-    await trace.log({ type: "governor_precheck_passed" });
+  // ===============================
+  // 🕸 4. GRAPH EXPANSION
+  // ===============================
+  const graphEdges = await this.graphTraversal(nodeIds);
+  await trace.logGraphTraversal(nodeIds);
 
-    // 🔷 STEP 2: EMBEDDING
-    const queryEmbedding = await this.embedQuery(query);
+  // ===============================
+  // 🧭 5. DECISION ENGINE (MEMORY-AWARE)
+  // ===============================
+  const decision = await this.decisionEngine.selectAgent({
+    query,
+    vectorResults,
+    graphNodes: nodeIds,
+    agents: AGENT_REGISTRY,
+  });
 
-    // 🔷 STEP 3: VECTOR SEARCH
-    const vectorResults = await this.vectorSearch(queryEmbedding);
-    await trace.logVectorSearch(query, vectorResults.length);
+  await trace.log({
+    type: "agent_selected",
+    agent: decision.id,
+    score: decision.score,
+    memoryInfluenced: decision.memoryInfluenced,
+  });
 
-    const nodeIds = vectorResults.map((v) => v.id);
+  // ===============================
+  // 🤖 6. AGENT EXECUTION
+  // ===============================
+  await trace.logAgentExecution(decision.id, "start");
 
-    // 🔷 STEP 4: GRAPH EXPANSION
-    const graphEdges = await this.graphTraversal(nodeIds);
-    await trace.logGraphTraversal(nodeIds);
+  const result = await executeAgent(
+    decision.id,
+    {
+      query,
+      vector_results: vectorResults,
+      graph_edges: graphEdges,
+      selected_nodes: nodeIds,
+    },
+    { trace }
+  );
 
-    // 🔷 STEP 5: LOAD SYSTEM MEMORY (IMPORTANT)
-    const systemBias = await getSystemMemory("agent_policy");
+  await trace.logAgentExecution(decision.id, "success");
 
-    await trace.log({
-      type: "system_memory_loaded",
+  // ===============================
+  // 📊 7. LEARNING PHASE
+  // ===============================
+  const signals = await this.learningBrain.fetchRecentSignals(50);
+
+  await trace.log({
+    type: "learning_snapshot",
+    count: signals.length,
+  });
+
+  // ===============================
+  // 🔁 8. AUTONOMY ANALYSIS
+  // ===============================
+  const autonomySignal = await this.autonomyEngine.analyze(signals);
+
+  await trace.log({
+    type: "autonomy_signal_generated",
+    signal: autonomySignal?.type || null,
+  });
+
+  // ===============================
+  // 🧠 9. GOVERNED MEMORY UPDATE
+  // ===============================
+  if (autonomySignal) {
+    await this.governor.validateSystemChange({
+      query,
+      signal: autonomySignal,
+    });
+
+    await this.applySystemMemoryUpdate(autonomySignal, trace);
+  }
+
+  // ===============================
+  // 🔒 10. GOVERNOR POST-CHECK
+  // ===============================
+  await this.governor.postCheck({
+    query,
+    agent: decision.id,
+  });
+
+  await trace.finish("success");
+
+  // ===============================
+  // 📦 FINAL RESPONSE
+  // ===============================
+  return {
+    query,
+    traceId: trace.getTraceId(),
+
+    agent: decision,
+    result,
+
+    system_memory: {
       bias: systemBias,
-    });
+      vector: vectorBias,
+    },
 
-    // 🔷 STEP 6: DECISION ENGINE (MEMORY-AWARE)
-    const decision = await this.decisionEngine.selectAgent({
-      query,
-      vectorResults,
-      graphNodes: nodeIds,
-      agents: AGENT_REGISTRY,
-    });
+    reasoning: {
+      vector_hits: vectorResults,
+      graph_edges: graphEdges,
+      selected_nodes: nodeIds,
+    },
 
-    await trace.log({
-      type: "agent_selected",
-      agent: decision.id,
-      score: decision.score,
-      memoryInfluenced: decision.memoryInfluenced,
-    });
-
-    // 🔷 STEP 7: AGENT EXECUTION
-    await trace.logAgentExecution(decision.id, "start");
-
-    const result = await executeAgent(
-      decision.id,
-      {
-        query,
-        vector_results: vectorResults,
-        graph_edges: graphEdges,
-        selected_nodes: nodeIds,
-      },
-      { trace }
-    );
-
-    await trace.logAgentExecution(decision.id, "success");
-
-    // 🔷 STEP 8: LEARNING ANALYSIS
-    const signals = await this.learningBrain.fetchRecentSignals(50);
-
-    await trace.log({
-      type: "learning_snapshot",
-      count: signals.length,
-    });
-
-    // 🔷 STEP 9: AUTONOMY ANALYSIS
-    const autonomySignal = await this.autonomyEngine.analyze(signals);
-
-    await trace.log({
-      type: "autonomy_signal",
-      signal: autonomySignal?.type || null,
-    });
-
-    // 🔷 STEP 10: GOVERNOR VALIDATION
-    if (autonomySignal) {
-      await this.governor.validateSystemChange({
-        query,
-        signal: autonomySignal,
-      });
-
-      // 🔥 APPLY SYSTEM UPDATE (CONTROLLED)
-      await applySystemUpdate(
-        "system_policy",
-        autonomySignal,
-        {
-          reason: autonomySignal.payload?.reason,
-          source: "autonomy_engine",
-        }
-      );
-
-      await trace.log({
-        type: "system_memory_updated",
-        update: autonomySignal.type,
-      });
-    }
-
-    await this.governor.postCheck({
-      query,
-      agent: decision.id,
-    });
-
-    await trace.finish("success");
-
-    return {
-      query,
-      traceId: trace.getTraceId(),
-
-      agent: decision,
-      result,
-
-      reasoning: {
-        vector_hits: vectorResults,
-        graph_edges: graphEdges,
-        selected_nodes: nodeIds,
-        memory_bias: systemBias,
-      },
-
-      autonomy: autonomySignal || null,
-    };
-  }
-
-  /**
-   * 🔍 EMBEDDING ENGINE
-   */
-  private async embedQuery(text: string): Promise<number[]> {
-    const res = await openai.embeddings.create({
-      model: "text-embedding-3-small",
-      input: text,
-    });
-
-    return res.data[0].embedding;
-  }
-
-  /**
-   * 🔍 VECTOR SEARCH
-   */
-  private async vectorSearch(queryEmbedding: number[]) {
-    const { data, error } = await supabase.rpc("match_nodes", {
-      query_embedding: queryEmbedding,
-      match_threshold: 0.7,
-      match_count: 5,
-    });
-
-    if (error) throw error;
-    return data || [];
-  }
-
-  /**
-   * 🕸 GRAPH TRAVERSAL
-   */
-  private async graphTraversal(nodeIds: string[]) {
-    if (!nodeIds.length) return [];
-
-    const { data, error } = await supabase
-      .from("edges")
-      .select("from_node_id, to_node_id, label, strength")
-      .in("from_node_id", nodeIds);
-
-    if (error) throw error;
-    return data || [];
-  }
+    autonomy: autonomySignal || null,
+  };
 }
