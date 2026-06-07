@@ -1,4 +1,6 @@
 import "dotenv/config";
+import "dotenv/config";
+import { acquireLock, releaseLock } from "../utils/lock";
 import { createClient } from "@supabase/supabase-js";
 
 import { AGENT_REGISTRY } from "../agents/registry";
