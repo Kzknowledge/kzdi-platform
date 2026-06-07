@@ -113,7 +113,69 @@ export class MCPBrain {
     await trace.logAgentExecution(decision.id, "success");
 
     // ===============================
-    // 📊 8. LEARNING PHASE
+    // 🧠 8. RL FEEDBACK LOOP (AUDITED + SAFE)
+    // ===============================
+
+    const startTime = Date.now();
+
+    let success = true;
+    let confidence = 0.5;
+
+    try {
+      success =
+        typeof result === "object" &&
+        result !== null &&
+        (result.success !== false);
+
+      confidence =
+        typeof decision?.score === "number"
+          ? decision.score
+          : 0.5;
+    } catch (err) {
+      await trace.log({
+        type: "rl_signal_parse_error",
+        error: (err as Error).message,
+      });
+    }
+
+    const durationMs = Date.now() - startTime;
+
+    let rlSignal: any = null;
+
+    try {
+      rlSignal = await this.computeReinforcementSignal({
+        success,
+        durationMs,
+        confidence,
+        agentId: decision.id,
+      });
+    } catch (err) {
+      await trace.log({
+        type: "rl_signal_compute_failed",
+        error: (err as Error).message,
+      });
+    }
+
+    if (rlSignal) {
+      await trace.log({
+        type: "reinforcement_signal",
+        signal: rlSignal,
+      });
+    }
+
+    try {
+      if (rlSignal) {
+        await this.applyReinforcementUpdate(rlSignal);
+      }
+    } catch (err) {
+      await trace.log({
+        type: "rl_memory_update_failed",
+        error: (err as Error).message,
+      });
+    }
+
+    // ===============================
+    // 📊 9. LEARNING PHASE
     // ===============================
     const signals = await this.learningBrain.fetchRecentSignals(50);
 
@@ -123,7 +185,7 @@ export class MCPBrain {
     });
 
     // ===============================
-    // 🔁 9. AUTONOMY ANALYSIS
+    // 🔁 10. AUTONOMY ANALYSIS
     // ===============================
     const autonomySignal = await this.autonomyEngine.analyze(signals);
 
@@ -133,7 +195,7 @@ export class MCPBrain {
     });
 
     // ===============================
-    // 🧠 10. GOVERNED MEMORY UPDATE
+    // 🧠 11. GOVERNED MEMORY UPDATE
     // ===============================
     if (autonomySignal) {
       await this.governor.validateSystemChange({
@@ -145,7 +207,7 @@ export class MCPBrain {
     }
 
     // ===============================
-    // 🔒 11. GOVERNOR POST-CHECK
+    // 🔒 12. GOVERNOR POST-CHECK
     // ===============================
     await this.governor.postCheck({
       query,
@@ -176,12 +238,61 @@ export class MCPBrain {
       },
 
       autonomy: autonomySignal || null,
+      reinforcement: rlSignal || null,
     };
   }
 
-  /**
-   * 🧠 SYSTEM MEMORY UPDATE HANDLER (GOVERNED)
-   */
+  // ===============================
+  // 🧠 RL ENGINE (SAFE)
+  // ===============================
+  private async computeReinforcementSignal(params: {
+    success: boolean;
+    durationMs?: number;
+    confidence?: number;
+    agentId: string;
+  }) {
+    const { success, durationMs = 0, confidence = 0.5, agentId } = params;
+
+    let reward = 0;
+
+    reward += success ? 1 : -1;
+    reward += confidence * 0.5;
+
+    if (durationMs > 3000) {
+      reward -= 0.2;
+    }
+
+    reward = Math.max(-1, Math.min(1, reward));
+
+    return {
+      agentId,
+      reward,
+      success,
+      durationMs,
+      confidence,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  private async applyReinforcementUpdate(signal: any) {
+    const policy = await getSystemMemory("agent_policy");
+    const agentId = signal.agentId;
+
+    const current = policy?.[agentId] ?? 0.5;
+
+    const updated = current * 0.8 + signal.reward * 0.2;
+
+    await applySystemUpdate("agent_policy", {
+      strategy: "rl_update",
+      agentId,
+      reward: signal.reward,
+      updatedScore: updated,
+    });
+  }
+
+  // ===============================
+  // 🧠 SYSTEM MEMORY UPDATE HANDLER
+  // ===============================
   private async applySystemMemoryUpdate(
     signal: any,
     trace: MCPTraceEngine
@@ -213,9 +324,9 @@ export class MCPBrain {
     });
   }
 
-  /**
-   * 🔍 EMBEDDING ENGINE
-   */
+  // ===============================
+  // 🔍 EMBEDDING ENGINE
+  // ===============================
   private async embedQuery(text: string): Promise<number[]> {
     const res = await openai.embeddings.create({
       model: "text-embedding-3-small",
@@ -225,9 +336,9 @@ export class MCPBrain {
     return res.data[0].embedding;
   }
 
-  /**
-   * 🔍 VECTOR SEARCH
-   */
+  // ===============================
+  // 🔍 VECTOR SEARCH
+  // ===============================
   private async vectorSearch(queryEmbedding: number[]) {
     const { data, error } = await supabase.rpc("match_nodes", {
       query_embedding: queryEmbedding,
@@ -239,9 +350,9 @@ export class MCPBrain {
     return data || [];
   }
 
-  /**
-   * 🕸 GRAPH TRAVERSAL
-   */
+  // ===============================
+  // 🕸 GRAPH TRAVERSAL
+  // ===============================
   private async graphTraversal(nodeIds: string[]) {
     if (!nodeIds.length) return [];
 
@@ -253,4 +364,4 @@ export class MCPBrain {
     if (error) throw error;
     return data || [];
   }
-}
+    }
