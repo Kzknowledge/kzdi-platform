@@ -1,101 +1,110 @@
 import { createClient } from "@supabase/supabase-js";
-import { MCPLearningBrain } from "./learningBrain";
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
-  process.env.SUPABASE_KEY!
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
 /**
  * MCP Autonomy Engine
- * Applies learned insights back into system behavior
- * (closed-loop optimization layer)
+ * Controlled self-optimization layer (governor-restricted)
  */
 
-type SystemWeights = {
-  vectorWeight: number;
-  graphWeight: number;
-  agentBias: Record<string, number>;
-};
-
 export class MCPAutonomyEngine {
-  private learningBrain: MCPLearningBrain;
-
-  constructor() {
-    this.learningBrain = new MCPLearningBrain();
-  }
-
   /**
-   * Pull latest learned system intelligence
+   * Update system learning weights
    */
-  async getLatestSystemState(): Promise<SystemWeights> {
-    const learned = await this.learningBrain.computeAdaptiveWeights();
+  async updateSystemWeights(input: {
+    vectorWeight: number;
+    graphWeight: number;
+    agentBias: Record<string, number>;
+    traceId?: string;
+  }) {
+    const { vectorWeight, graphWeight, agentBias, traceId } = input;
+
+    // 🔷 clamp values (SAFETY BOUNDARY)
+    const safeVector = Math.min(0.9, Math.max(0.1, vectorWeight));
+    const safeGraph = Math.min(0.9, Math.max(0.1, graphWeight));
+
+    await supabase.from("system_memory").insert({
+      key: "mcp_weights",
+      value: {
+        vectorWeight: safeVector,
+        graphWeight: safeGraph,
+        agentBias,
+      },
+      trace_id: traceId ?? null,
+      updated_at: new Date().toISOString(),
+    });
 
     return {
-      vectorWeight: learned.vectorWeight,
-      graphWeight: learned.graphWeight,
-      agentBias: learned.agentBias
+      success: true,
+      vectorWeight: safeVector,
+      graphWeight: safeGraph,
     };
   }
 
   /**
-   * Apply learned weights to system configuration (soft update)
+   * Update agent performance memory
    */
-  async applySystemAdjustments() {
-    const state = await this.getLatestSystemState();
+  async updateAgentBias(agentBias: Record<string, number>, traceId?: string) {
+    const safeBias: Record<string, number> = {};
 
-    // 🔷 store in Supabase for MCP Brain consumption
-    const { error } = await supabase
-      .from("system_memory")
-      .upsert({
-        id: "mcp_runtime_weights",
-        data: state,
-        updated_at: new Date().toISOString()
-      });
+    for (const [agent, score] of Object.entries(agentBias)) {
+      safeBias[agent] = Math.min(1, Math.max(0, score));
+    }
 
-    if (error) {
-      console.error("Autonomy update failed:", error.message);
+    await supabase.from("system_memory").insert({
+      key: "agent_bias",
+      value: safeBias,
+      trace_id: traceId ?? null,
+      updated_at: new Date().toISOString(),
+    });
+
+    return safeBias;
+  }
+
+  /**
+   * Full autonomy cycle (called after learning)
+   */
+  async runAutonomyCycle(input: {
+    learningOutput: {
+      vectorWeight: number;
+      graphWeight: number;
+      agentBias: Record<string, number>;
+    };
+    governor: any;
+    traceId?: string;
+  }) {
+    const { learningOutput, governor, traceId } = input;
+
+    // 🔐 GOVERNOR CHECK (CRITICAL)
+    if (!governor?.allowed) {
       return {
-        status: "failed",
-        error: error.message
+        success: false,
+        reason: "Blocked by MCP Governor",
       };
     }
 
-    return {
-      status: "success",
-      applied: state
-    };
-  }
+    // 🔷 STEP 1: Update weights
+    const weights = await this.updateSystemWeights({
+      vectorWeight: learningOutput.vectorWeight,
+      graphWeight: learningOutput.graphWeight,
+      agentBias: learningOutput.agentBias,
+      traceId,
+    });
 
-  /**
-   * Suggest real-time agent priority ordering
-   */
-  async getOptimizedAgentOrder(agentIds: string[]) {
-    const state = await this.getLatestSystemState();
-
-    const ranked = agentIds
-      .map(id => ({
-        id,
-        score: state.agentBias[id] || 0.5
-      }))
-      .sort((a, b) => b.score - a.score);
+    // 🔷 STEP 2: Update agent bias separately
+    const bias = await this.updateAgentBias(
+      learningOutput.agentBias,
+      traceId
+    );
 
     return {
-      rankedAgents: ranked,
-      weights: state
-    };
-  }
-
-  /**
-   * Full autonomy cycle runner (cron/job trigger)
-   */
-  async runAutonomyCycle() {
-    const result = await this.applySystemAdjustments();
-
-    return {
-      timestamp: new Date().toISOString(),
-      cycle: "mcp_autonomy_update",
-      result
+      success: true,
+      weights,
+      bias,
+      traceId,
     };
   }
 }
