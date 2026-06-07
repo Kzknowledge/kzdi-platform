@@ -2,14 +2,8 @@
 
 /**
  * KZDI Agent Registry
- * MCP Pipeline — Agent Definition + Observability Layer
+ * MCP Pipeline — Agent Definition + Execution + Trace Integration Layer
  * KZDI Technologies Ltd
- */
-
-/**
- * NOTE:
- * This registry is now MCP-aware.
- * Agents can optionally emit execution traces via context.telemetry
  */
 
 const AGENT_REGISTRY = [
@@ -86,7 +80,7 @@ function getAgent(agentId) {
 }
 
 /**
- * Find agent by alias (MCP-friendly lookup)
+ * Find agent by alias (MCP routing safe)
  */
 function getAgentByAlias(alias) {
   return AGENT_REGISTRY.find((a) => a.alias === alias);
@@ -100,8 +94,11 @@ function listByStatus(status) {
 }
 
 /**
- * Execute agent with optional MCP telemetry hook
- * (safe no-op if telemetry not provided)
+ * Execute agent with FULL MCP Trace + Telemetry support
+ *
+ * context can include:
+ * - trace: MCPTraceEngine (preferred)
+ * - telemetry: legacy fallback logger
  */
 async function executeAgent(agentId, payload, context = {}) {
   const agent = getAgent(agentId);
@@ -112,9 +109,13 @@ async function executeAgent(agentId, payload, context = {}) {
 
   const startTime = Date.now();
 
+  const trace = context.trace || null;
+  const telemetry = context.telemetry || null;
+
   try {
-    if (context.telemetry) {
-      context.telemetry.log({
+    // 🔷 TRACE: start
+    if (trace?.log) {
+      await trace.log({
         type: 'agent_execution_start',
         agent: agentId,
         alias: agent.alias,
@@ -122,7 +123,15 @@ async function executeAgent(agentId, payload, context = {}) {
       });
     }
 
-    // Placeholder execution contract (actual logic lives elsewhere)
+    // 🔷 TELEMETRY fallback (legacy compatibility)
+    if (!trace && telemetry?.log) {
+      telemetry.log({
+        type: 'agent_execution_start',
+        agent: agentId,
+      });
+    }
+
+    // 🔷 EXECUTION CONTRACT (placeholder layer)
     const result = {
       agent: agentId,
       alias: agent.alias,
@@ -131,8 +140,9 @@ async function executeAgent(agentId, payload, context = {}) {
       processed_at: new Date().toISOString(),
     };
 
-    if (context.telemetry) {
-      context.telemetry.log({
+    // 🔷 TRACE: success
+    if (trace?.log) {
+      await trace.log({
         type: 'agent_execution_success',
         agent: agentId,
         duration_ms: Date.now() - startTime,
@@ -142,8 +152,19 @@ async function executeAgent(agentId, payload, context = {}) {
     return result;
 
   } catch (err) {
-    if (context.telemetry) {
-      context.telemetry.log({
+
+    // 🔷 TRACE: failure
+    if (trace?.log) {
+      await trace.log({
+        type: 'agent_execution_failed',
+        agent: agentId,
+        error: err.message,
+      });
+    }
+
+    // 🔷 TELEMETRY fallback
+    if (!trace && telemetry?.log) {
+      telemetry.log({
         type: 'agent_execution_failed',
         agent: agentId,
         error: err.message,
