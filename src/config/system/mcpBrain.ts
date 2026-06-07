@@ -1,131 +1,100 @@
-import { MCPTraceEngine } from "./trace";
-import { executeAgent, getAgent } from "../../agents/registry";
-import { MCPExplanationEngine } from "./explanationEngine";
+import { MCPDecisionEngine } from "./decisionEngine";
+import { MCPGovernor } from "./mcpGovernor";
+import { MCPLearningBrain } from "./learningBrain";
+import { MCPAutonomyEngine } from "./autonomyEngine";
 
-/**
- * MCP Brain Layer
- * Unified orchestration layer for decision + execution + explanation
- */
+import { executeAgent, AGENT_REGISTRY } from "../../agents/registry";
 
 type VectorResult = { id: string; score: number };
-type GraphNode = { id: string; weight?: number };
+type GraphEdge = { from_node_id: string; to_node_id: string; label: string };
 
 export class MCPBrain {
-  private trace: MCPTraceEngine;
-  private explainer: MCPExplanationEngine;
-
-  constructor() {
-    this.trace = new MCPTraceEngine();
-    this.explainer = new MCPExplanationEngine();
-  }
-
-  getTraceId() {
-    return this.trace.getTraceId();
-  }
+  private decisionEngine = new MCPDecisionEngine();
+  private learningBrain = new MCPLearningBrain();
+  private autonomyEngine = new MCPAutonomyEngine();
+  private governor = new MCPGovernor();
 
   /**
-   * MAIN MCP ENTRY FUNCTION
+   * SINGLE ENTRY POINT FOR ALL MCP EXECUTION
    */
-  async run(query: string) {
-    try {
-      // 🔷 STEP 1: TRACE REQUEST
-      await this.trace.logRequestReceived(query);
+  async run(input: {
+    query: string;
+    vectorResults: VectorResult[];
+    graphEdges: GraphEdge[];
+    trace: any;
+  }) {
+    const { query, vectorResults, graphEdges, trace } = input;
 
-      // 🔷 STEP 2: VECTOR LAYER (placeholder for pgvector)
-      const vectorResults: VectorResult[] = [
-        { id: "node_mcp_core", score: 0.93 },
-        { id: "node_hausa_nlp", score: 0.89 }
-      ];
+    // 🔒 STEP 1: GOVERNOR PRE-CHECK
+    await this.governor.preCheck({ query });
 
-      await this.trace.logVectorSearch(query, vectorResults);
+    await trace.log({ type: "governor_precheck_passed" });
 
-      // 🔷 STEP 3: GRAPH LAYER (placeholder structure)
-      const graphNodes: GraphNode[] = [
-        { id: "node_mcp_core", weight: 0.8 },
-        { id: "node_hausa_nlp", weight: 0.7 }
-      ];
+    // 🔷 STEP 2: AGENT SELECTION (ONLY ONE AUTHORITY)
+    const decision = this.decisionEngine.selectAgent({
+      query,
+      vectorResults,
+      graphNodes: graphEdges.map((e) => e.from_node_id),
+      agents: AGENT_REGISTRY,
+    });
 
-      await this.trace.logGraphTraversal(
-        graphNodes.map(n => n.id),
-        []
-      );
+    await trace.log({
+      type: "agent_selected",
+      agent: decision.id,
+      score: decision.score,
+    });
 
-      // 🔷 STEP 4: SIMPLE INTERNAL DECISION (lightweight routing)
-      const selectedAgent = this.selectAgent(vectorResults, graphNodes);
+    // 🔷 STEP 3: AGENT EXECUTION
+    await trace.logAgentExecution(decision.id, "start");
 
-      await this.trace.log({
-        type: "agent_selected",
-        agent: selectedAgent.id,
-        alias: selectedAgent.alias
-      });
-
-      // 🔷 STEP 5: EXECUTE AGENT
-      await this.trace.logAgentExecution(selectedAgent.id, "start");
-
-      const agentResult = await executeAgent(
-        selectedAgent.id,
-        {
-          query,
-          context_nodes: graphNodes,
-          vector_results: vectorResults
-        },
-        { trace: this.trace }
-      );
-
-      await this.trace.logAgentExecution(selectedAgent.id, "success");
-
-      // 🔷 STEP 6: EXPLANATION ENGINE
-      const explanation = this.explainer.explain({
+    const result = await executeAgent(
+      decision.id,
+      {
         query,
-        selectedAgent,
-        vectorResults,
-        graphNodes
-      });
+        vector_results: vectorResults,
+        graph_edges: graphEdges,
+      },
+      { trace }
+    );
 
-      // 🔷 STEP 7: FINAL TRACE
-      await this.trace.finish("success");
+    await trace.logAgentExecution(decision.id, "success");
 
-      // 🔷 FINAL OUTPUT
-      return {
-        query,
-        agent: agentResult,
-        explanation,
-        traceId: this.getTraceId()
-      };
+    // 🔷 STEP 4: TRACE COMPLETION EVENT
+    await trace.log({
+      type: "execution_complete",
+      agent: decision.id,
+    });
 
-    } catch (err: any) {
-      await this.trace.logRequestFailed(err.message);
-      await this.trace.finish("failed");
+    // 🔷 STEP 5: LEARNING UPDATE (READ ONLY)
+    const learning = await this.learningBrain.fetchRecentSignals(50);
 
-      return {
-        error: err.message,
-        traceId: this.getTraceId()
-      };
-    }
+    await trace.log({
+      type: "learning_snapshot",
+      count: learning.length,
+    });
+
+    // 🔷 STEP 6: AUTONOMY PROPOSAL (NO WRITE YET)
+    const autonomySignal =
+      await this.autonomyEngine.analyze?.(learning);
+
+    await trace.log({
+      type: "autonomy_evaluated",
+      hasSignal: !!autonomySignal,
+    });
+
+    // 🔒 STEP 7: GOVERNOR POST-CHECK
+    await this.governor.postCheck({
+      query,
+      agent: decision.id,
+    });
+
+    await trace.finish("success");
+
+    return {
+      agent: decision,
+      result,
+      learning_snapshot: learning.length,
+      autonomy_signal: autonomySignal || null,
+    };
   }
-
-  /**
-   * INTERNAL LIGHTWEIGHT DECISION FUNCTION
-   * (kept simple since full decision engine is optional layer)
-   */
-  private selectAgent(vectorResults: VectorResult[], graphNodes: GraphNode[]) {
-    const vectorStrength =
-      vectorResults.reduce((sum, v) => sum + v.score, 0) /
-      (vectorResults.length || 1);
-
-    const graphStrength =
-      graphNodes.reduce((sum, g) => sum + (g.weight ?? 0.5), 0) /
-      (graphNodes.length || 1);
-
-    // 🔷 RULE BASED HYBRID SELECTION
-    if (vectorStrength > 0.9) {
-      return getAgent("KZDI-CORE-AGENT-01")!;
-    }
-
-    if (graphStrength > 0.75) {
-      return getAgent("KZDI-CORE-AGENT-02")!;
-    }
-
-    return getAgent("KZDI-CORE-AGENT-01")!;
-  }
-  }
+}
