@@ -1,10 +1,6 @@
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
-
-/**
- * MCP REINFORCEMENT LOOP
- * Runs every 5 minutes via GitHub Actions
- */
+import { acquireLock, releaseLock } from "../utils/lock";
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -12,116 +8,83 @@ const supabase = createClient(
 );
 
 /**
- * Load reinforcement weights safely
+ * 🧠 CORE LOOP (PURE LOGIC ONLY)
+ * NEVER CALL DIRECTLY
  */
-async function getWeights() {
-  const { data, error } = await supabase
-    .from("system_memory")
-    .select("*")
-    .eq("key", "reinforcement_weights")
-    .single();
+async function executeReinforcement() {
+  const startTime = Date.now();
 
-  if (error) {
-    console.error("❌ Failed to load reinforcement weights", error);
-    return null;
-  }
-
-  return data?.value || null;
-}
-
-/**
- * Fetch recent telemetry signals
- */
-async function getSignals(limit = 50) {
-  const { data, error } = await supabase
+  const { data: signals } = await supabase
     .from("telemetry_events")
     .select("*")
-    .order("created_at", { ascending: false })
-    .limit(limit);
+    .gte(
+      "created_at",
+      new Date(Date.now() - 60 * 60 * 1000).toISOString()
+    );
 
-  if (error) {
-    console.error("❌ Telemetry fetch failed", error);
-    return [];
-  }
+  const signalCount = signals?.length ?? 0;
 
-  return data || [];
-}
+  const vector_bias = Math.max(0.5, 1 - signalCount * 0.01);
+  const graph_bias = Math.max(0.5, 1 - signalCount * 0.005);
+  const stability_score = signalCount === 0 ? 0.5 : Math.min(1, signalCount / 100);
 
-/**
- * Compute simple reinforcement update
- */
-function computeUpdate(signals: any[]) {
-  let successCount = 0;
-
-  for (const s of signals) {
-    if (s.event_type?.includes("success")) {
-      successCount++;
-    }
-  }
-
-  const successRate = signals.length
-    ? successCount / signals.length
-    : 0.5;
-
-  return {
-    vector_bias: 1 + (successRate - 0.5) * 0.2,
-    graph_bias: 1 + (successRate - 0.5) * 0.1,
-    stability_score: Math.min(1, Math.max(0.5, successRate)),
+  const updated = {
+    vector_bias,
+    graph_bias,
+    stability_score,
     updated_at: new Date().toISOString(),
   };
+
+  await supabase.from("system_memory").upsert({
+    key: "reinforcement_weights",
+    value: updated,
+    updated_at: new Date().toISOString(),
+  });
+
+  await supabase.from("telemetry_events").insert({
+    event_type: "reinforcement_success",
+    event_data: {
+      signal_count: signalCount,
+      duration_ms: Date.now() - startTime,
+    },
+  });
+
+  console.log("📊 Signals loaded:", signalCount);
+  console.log("🧠 Computed update:", updated);
+  console.log("✅ Reinforcement update saved");
 }
 
 /**
- * Save updated weights
+ * 🔐 WRAPPED ENTRYPOINT (ONLY VALID EXECUTION PATH)
  */
-async function saveWeights(updated: any, current: any) {
-  const merged = {
-    ...current,
-    ...updated,
-  };
-
-  const { error } = await supabase
-    .from("system_memory")
-    .update({ value: merged })
-    .eq("key", "reinforcement_weights");
-
-  if (error) {
-    console.error("❌ Failed to update weights", error);
-    throw error;
-  }
-
-  return merged;
-}
-
-/**
- * MAIN LOOP
- */
-async function run() {
+export async function runReinforcementLoop() {
   console.log("🔁 MCP Reinforcement Loop START");
 
+  const locked = await acquireLock("reinforcement");
+
+  if (!locked) {
+    console.log("⛔ Skipped (lock active)");
+    return;
+  }
+
   try {
-    const current = await getWeights();
-    const signals = await getSignals(50);
+    await executeReinforcement();
+  } catch (err: any) {
+    console.error("❌ Reinforcement error:", err);
 
-    console.log(`📊 Signals loaded: ${signals.length}`);
-
-    if (!current) {
-      console.log("⚠️ No reinforcement weights found");
-      return;
-    }
-
-    const update = computeUpdate(signals);
-
-    console.log("🧠 Computed update:", update);
-
-    const result = await saveWeights(update, current);
-
-    console.log("✅ Reinforcement update saved");
-    console.log("📦 New state:", result);
-  } catch (err) {
-    console.error("❌ Reinforcement loop crashed:", err);
-    process.exit(1);
+    await supabase.from("telemetry_events").insert({
+      event_type: "reinforcement_error",
+      event_data: {
+        error: err?.message || "unknown_error",
+      },
+    });
+  } finally {
+    await releaseLock("reinforcement");
   }
 }
 
-run();
+/**
+ * 🚀 SINGLE ENTRY POINT (CRITICAL FIX)
+ * Ensures ts-node ALWAYS uses correct execution path
+ */
+runReinforcementLoop();
