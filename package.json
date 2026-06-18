@@ -17,6 +17,9 @@
     "dotenv": "^17.4.2"
   },
   "devDependencies": {
-    "node-fetch": "^3.3.2"
+    "@types/node": "^20.11.0",
+    "node-fetch": "^3.3.2",
+    "typescript": "^5.3.3",
+    "ts-node": "^10.9.2"
   }
 }
