@@ -11,10 +11,11 @@
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,
+    "ignoreDeprecations": "6.0",
 
     "types": ["node"],
 
-    "moduleResolution": "node"
+    "moduleResolution": "bundler"
   },
   "include": [
     "src",
