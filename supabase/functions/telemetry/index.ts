@@ -1,90 +1,124 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.43.2";
 
-// Build trigger revision: 1.0.3 — EDGE-001: custom x-edge-secret header auth
-const SYSTEM_MEMORY = {
-  hardware_constraints: { host_device: "Samsung Galaxy M15" },
-};
+// ─────────────────────────────────────────────────────────────
+// MCP TELEMETRY CORE v1.1.0
+// Observability ingestion layer for KZDI MCP system
+// ─────────────────────────────────────────────────────────────
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const EDGE_SECRET = Deno.env.get("EDGE_SECRET");
 
-if (!supabaseUrl || !supabaseServiceKey) {
-  throw new Error("CRITICAL CONFIGURATION ERROR: Environment variables are unmapped.");
+if (!supabaseUrl || !supabaseServiceKey || !EDGE_SECRET) {
+  throw new Error("CRITICAL CONFIG ERROR: Missing environment variables");
 }
 
-// Instantiate the Supabase client pinned strictly to your isolated telemetry schema layer
 const supabase = createClient(supabaseUrl, supabaseServiceKey, {
-  db: { schema: 'telemetry' }
+  db: { schema: "telemetry" }
 });
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
+// ─────────────────────────────────────────────────────────────
+// Internal utilities
+// ─────────────────────────────────────────────────────────────
+
+function createRequestId(body: any, req: Request) {
+  return body?.request_id ||
+         req.headers.get("x-request-id") ||
+         crypto.randomUUID();
+}
+
+function normalizeEventType(event_type: string) {
+  return event_type.trim().toLowerCase();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Edge Function
+// ─────────────────────────────────────────────────────────────
+
 Deno.serve(async (req: Request) => {
 
-  // ── EDGE-001: x-edge-secret header validation ─────────────────────────────
-  // Uses custom header instead of Authorization to avoid Supabase gateway
-  // interception. ISO 27001 A.8.20 — network-level access control.
-  const edgeSecret = Deno.env.get("EDGE_SECRET");
-  const token = req.headers.get("x-edge-secret") ?? null;
+  // ── AUTH LAYER ─────────────────────────────────────────────
+  const token = req.headers.get("x-edge-secret");
 
-  if (!edgeSecret || token !== edgeSecret) {
+  if (token !== EDGE_SECRET) {
     return new Response(
       JSON.stringify({ success: false, error: "Unauthorized" }),
       { status: 401, headers: jsonHeaders }
     );
   }
-  // ── End EDGE-001 ──────────────────────────────────────────────────────────
 
-  // Enforce rigid RESTful POST communication paths
   if (req.method !== "POST") {
     return new Response(
-      JSON.stringify({ success: false, error: "Method not allowed. Use POST payload transactions." }),
+      JSON.stringify({ success: false, error: "POST required" }),
       { status: 405, headers: jsonHeaders }
     );
   }
 
   try {
     const body = await req.json();
-    const { event_type, source_agent_id, skill_id, status, event_data, error_message } = body;
 
-    // Rigid schema validation for core non-nullable keys
+    const request_id = createRequestId(body, req);
+    const event_type = normalizeEventType(body.event_type);
+
+    const {
+      source_agent_id = "unknown-agent",
+      skill_id = null,
+      status,
+      event_data = {},
+      error_message = null,
+    } = body;
+
+    // ── VALIDATION ────────────────────────────────────────────
     if (!event_type || !status) {
       return new Response(
-        JSON.stringify({ success: false, error: "Missing required tracking parameters: 'event_type' and 'status' are required fields." }),
+        JSON.stringify({
+          success: false,
+          error: "Missing required fields: event_type, status"
+        }),
         { status: 400, headers: jsonHeaders }
       );
     }
 
-    // Inject data payloads directly into telemetry.telemetry_events table
+    // ── INSERT TELEMETRY EVENT ───────────────────────────────
     const { data, error } = await supabase
       .from("telemetry_events")
-      .insert([
-        {
-          event_type,
-          source_agent_id: source_agent_id ?? "unknown-agent",
-          skill_id,
-          status,
-          // Merges incoming JSON logs with your system metadata signature
-          event_data: {
-            ...(event_data ?? {}),
-            device_host: SYSTEM_MEMORY.hardware_constraints.host_device
-          },
-          error_message,
-        }
-      ])
-      .select("id");
+      .insert([{
+        request_id,
+        event_type,
+        source_agent_id,
+        skill_id,
+        status,
+        event_data: {
+          ...event_data,
+          timestamp: new Date().toISOString(),
+          runtime: "deno-edge"
+        },
+        error_message,
+      }])
+      .select("id")
+      .single();
 
     if (error) throw error;
 
+    // ── RESPONSE ─────────────────────────────────────────────
     return new Response(
-      JSON.stringify({ success: true, tracking_id: data?.[0]?.id }),
+      JSON.stringify({
+        success: true,
+        request_id,
+        tracking_id: data.id
+      }),
       { status: 200, headers: jsonHeaders }
     );
 
-  } catch (err: unknown) {
-    const errorDetails = err instanceof Error ? err.message : String(err);
+  } catch (err) {
     return new Response(
-      JSON.stringify({ success: false, error: "Database transaction isolation write failure", msg: errorDetails }),
+      JSON.stringify({
+        success: false,
+        error: "telemetry_ingestion_failed",
+        detail: String(err)
+      }),
       { status: 500, headers: jsonHeaders }
     );
   }
