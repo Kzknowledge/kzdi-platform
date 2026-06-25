@@ -1,9 +1,9 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.43.2";
 
-// ─────────────────────────────────────────────────────────────
-// MCP TELEMETRY CORE v1.1.0
-// Observability ingestion layer for KZDI MCP system
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// MCP TELEMETRY CORE v2.0 (STRICT MODE)
+// KZDI Observability Ingestion Layer
+// ─────────────────────────────────────────────
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -19,27 +19,44 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey, {
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
-// ─────────────────────────────────────────────────────────────
-// Internal utilities
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// CONTRACT VALIDATION (STRICT MODE)
+// ─────────────────────────────────────────────
 
-function createRequestId(body: any, req: Request) {
-  return body?.request_id ||
-         req.headers.get("x-request-id") ||
-         crypto.randomUUID();
+const REQUIRED_FIELDS = [
+  "trace_id",
+  "request_id",
+  "event_type",
+  "status",
+  "source",
+  "agent",
+  "timestamp"
+];
+
+function validateContract(body: any) {
+  for (const field of REQUIRED_FIELDS) {
+    if (!body?.[field]) {
+      return { valid: false, missing: field };
+    }
+  }
+  return { valid: true };
 }
+
+// ─────────────────────────────────────────────
+// UTILITIES
+// ─────────────────────────────────────────────
 
 function normalizeEventType(event_type: string) {
   return event_type.trim().toLowerCase();
 }
 
-// ─────────────────────────────────────────────────────────────
-// Edge Function
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// EDGE FUNCTION
+// ─────────────────────────────────────────────
 
 Deno.serve(async (req: Request) => {
 
-  // ── AUTH LAYER ─────────────────────────────────────────────
+  // ── AUTH LAYER ─────────────────────────────
   const token = req.headers.get("x-edge-secret");
 
   if (token !== EDGE_SECRET) {
@@ -59,55 +76,63 @@ Deno.serve(async (req: Request) => {
   try {
     const body = await req.json();
 
-    const request_id = createRequestId(body, req);
-    const event_type = normalizeEventType(body.event_type);
+    // ── CONTRACT VALIDATION ─────────────────────
+    const validation = validateContract(body);
 
-    const {
-      source_agent_id = "unknown-agent",
-      skill_id = null,
-      status,
-      event_data = {},
-      error_message = null,
-    } = body;
-
-    // ── VALIDATION ────────────────────────────────────────────
-    if (!event_type || !status) {
+    if (!validation.valid) {
       return new Response(
         JSON.stringify({
           success: false,
-          error: "Missing required fields: event_type, status"
+          error: "missing_required_field",
+          field: validation.missing
         }),
         { status: 400, headers: jsonHeaders }
       );
     }
 
-    // ── INSERT TELEMETRY EVENT ───────────────────────────────
-    const { data, error } = await supabase
+    const event_type = normalizeEventType(body.event_type);
+
+    const {
+      trace_id,
+      request_id,
+      status,
+      source,
+      agent,
+      timestamp,
+      data = {},
+      context = {}
+    } = body;
+
+    // ── INSERT TELEMETRY EVENT ─────────────────────
+    const { data: result, error } = await supabase
       .from("telemetry_events")
       .insert([{
+        trace_id,
         request_id,
         event_type,
-        source_agent_id,
-        skill_id,
         status,
+        source,
+        agent_id: agent,
         event_data: {
-          ...event_data,
-          timestamp: new Date().toISOString(),
+          ...data,
+          context,
+          timestamp: timestamp || new Date().toISOString(),
           runtime: "deno-edge"
-        },
-        error_message,
+        }
       }])
       .select("id")
       .single();
 
     if (error) throw error;
 
-    // ── RESPONSE ─────────────────────────────────────────────
+    // ── RESPONSE ─────────────────────────────────────
     return new Response(
       JSON.stringify({
         success: true,
+        trace_id,
         request_id,
-        tracking_id: data.id
+        tracking_id: result.id,
+        event_type
       }),
       { status: 200, headers: jsonHeaders }
     );
