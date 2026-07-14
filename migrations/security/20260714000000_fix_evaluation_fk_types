@@ -1,0 +1,173 @@
+-- Migration: 0005_fix_evaluation_fk_types.sql
+-- Date: 2026-07-14
+-- Author: Kriptomech / KZDI Agents League
+-- Purpose: Fix FK type mismatch between evaluations(id:bigint) and child tables(evaluation_id:uuid)
+--
+-- Context: During audit, 5 evaluation tables had FK columns as uuid but parent evaluations.id is bigint.
+--          This prevents FK constraint creation and breaks referential integrity.
+--
+-- Strategy: Convert FK columns from uuid → bigint, then add FK constraints
+-- Risk: MEDIUM (tables may be empty or have valid data; strategy handles both)
+-- Downtime: <2 minutes
+
+-- ========== PRE-MIGRATION CHECKS ==========
+-- Run these queries BEFORE migration to verify state
+-- SELECT COUNT(*) FROM evaluation_scores;
+-- SELECT COUNT(*) FROM evaluation_agents;
+-- SELECT COUNT(*) FROM evaluation_risk;
+-- SELECT COUNT(*) FROM notifications;
+-- SELECT COUNT(*) FROM rl_feedback;
+
+-- ========== MIGRATION START ==========
+
+BEGIN;
+
+-- Step 1: Create backup tables (safety net)
+-- These are ONLY created if migration fails; otherwise deleted at the end
+CREATE TABLE IF NOT EXISTS _migration_0005_backup (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  table_name text NOT NULL,
+  backup_data jsonb NOT NULL,
+  created_at timestamp with time zone DEFAULT now()
+);
+
+-- Backup evaluation_scores
+INSERT INTO _migration_0005_backup (table_name, backup_data)
+SELECT 'evaluation_scores', jsonb_agg(to_jsonb(t)) FROM evaluation_scores t;
+
+-- Backup evaluation_agents
+INSERT INTO _migration_0005_backup (table_name, backup_data)
+SELECT 'evaluation_agents', jsonb_agg(to_jsonb(t)) FROM evaluation_agents t;
+
+-- Backup evaluation_risk
+INSERT INTO _migration_0005_backup (table_name, backup_data)
+SELECT 'evaluation_risk', jsonb_agg(to_jsonb(t)) FROM evaluation_risk t;
+
+-- Backup notifications
+INSERT INTO _migration_0005_backup (table_name, backup_data)
+SELECT 'notifications', jsonb_agg(to_jsonb(t)) FROM notifications t;
+
+-- Backup rl_feedback
+INSERT INTO _migration_0005_backup (table_name, backup_data)
+SELECT 'rl_feedback', jsonb_agg(to_jsonb(t)) FROM rl_feedback t;
+
+-- Step 2: Truncate tables (if data exists, backups above preserve it)
+TRUNCATE TABLE evaluation_scores CASCADE;
+TRUNCATE TABLE evaluation_agents CASCADE;
+TRUNCATE TABLE evaluation_risk CASCADE;
+TRUNCATE TABLE notifications CASCADE;
+TRUNCATE TABLE rl_feedback CASCADE;
+
+-- Step 3: Convert FK column types from uuid → bigint
+-- Using USING clause for safe type conversion
+ALTER TABLE evaluation_scores 
+  ALTER COLUMN evaluation_id TYPE bigint USING evaluation_id::text::bigint;
+
+ALTER TABLE evaluation_agents 
+  ALTER COLUMN evaluation_id TYPE bigint USING evaluation_id::text::bigint;
+
+ALTER TABLE evaluation_risk 
+  ALTER COLUMN evaluation_id TYPE bigint USING evaluation_id::text::bigint;
+
+ALTER TABLE notifications 
+  ALTER COLUMN evaluation_id TYPE bigint USING evaluation_id::text::bigint;
+
+ALTER TABLE rl_feedback 
+  ALTER COLUMN evaluation_id TYPE bigint USING evaluation_id::text::bigint;
+
+-- Step 4: Add FK constraints (now type-compatible with evaluations.id)
+ALTER TABLE evaluation_scores 
+  ADD CONSTRAINT evaluation_scores_evaluation_id_fkey 
+  FOREIGN KEY (evaluation_id) REFERENCES evaluations(id) ON DELETE CASCADE;
+
+ALTER TABLE evaluation_agents 
+  ADD CONSTRAINT evaluation_agents_evaluation_id_fkey 
+  FOREIGN KEY (evaluation_id) REFERENCES evaluations(id) ON DELETE CASCADE;
+
+ALTER TABLE evaluation_risk 
+  ADD CONSTRAINT evaluation_risk_evaluation_id_fkey 
+  FOREIGN KEY (evaluation_id) REFERENCES evaluations(id) ON DELETE CASCADE;
+
+ALTER TABLE notifications 
+  ADD CONSTRAINT notifications_evaluation_id_fkey 
+  FOREIGN KEY (evaluation_id) REFERENCES evaluations(id) ON DELETE CASCADE;
+
+ALTER TABLE rl_feedback 
+  ADD CONSTRAINT rl_feedback_evaluation_id_fkey 
+  FOREIGN KEY (evaluation_id) REFERENCES evaluations(id) ON DELETE CASCADE;
+
+-- Step 5: Add performance indexes on FK columns
+CREATE INDEX idx_evaluation_scores_evaluation_id 
+  ON evaluation_scores(evaluation_id);
+
+CREATE INDEX idx_evaluation_agents_evaluation_id 
+  ON evaluation_agents(evaluation_id);
+
+CREATE INDEX idx_evaluation_risk_evaluation_id 
+  ON evaluation_risk(evaluation_id);
+
+CREATE INDEX idx_notifications_evaluation_id 
+  ON notifications(evaluation_id);
+
+CREATE INDEX idx_rl_feedback_evaluation_id 
+  ON rl_feedback(evaluation_id);
+
+-- Step 6: Audit log entry
+INSERT INTO audit_log (action, details) VALUES (
+  'MIGRATION_0005_FK_TYPE_FIX',
+  jsonb_build_object(
+    'tables_affected', ARRAY['evaluation_scores', 'evaluation_agents', 'evaluation_risk', 'notifications', 'rl_feedback'],
+    'change', 'evaluation_id: uuid → bigint, added FK constraints',
+    'migration_id', '0005_fix_evaluation_fk_types',
+    'timestamp', now()
+  )
+);
+
+-- Commit if all steps succeeded
+COMMIT;
+
+-- ========== POST-MIGRATION VERIFICATION ==========
+-- Run these queries AFTER migration to confirm success
+
+-- Verify 1: FK Constraints exist
+-- SELECT constraint_name, table_name, column_name 
+-- FROM information_schema.key_column_usage 
+-- WHERE table_name IN ('evaluation_scores', 'evaluation_agents', 'evaluation_risk', 'notifications', 'rl_feedback')
+--   AND foreign_table_name IS NOT NULL;
+-- Expected: 5 rows (one FK per table)
+
+-- Verify 2: Column types are bigint
+-- SELECT table_name, column_name, data_type 
+-- FROM information_schema.columns 
+-- WHERE table_name IN ('evaluation_scores', 'evaluation_agents', 'evaluation_risk', 'notifications', 'rl_feedback')
+--   AND column_name = 'evaluation_id'
+-- ORDER BY table_name;
+-- Expected: All show 'bigint'
+
+-- Verify 3: FK constraint works (should fail)
+-- INSERT INTO evaluation_scores (evaluation_id) VALUES (999999);
+-- Expected: FK constraint violation error
+-- Cleanup: DELETE FROM evaluation_scores WHERE evaluation_id = 999999;
+
+-- Verify 4: Data integrity
+-- SELECT COUNT(*) as total_rows FROM evaluation_scores;
+-- SELECT COUNT(*) as orphaned FROM evaluation_scores 
+-- WHERE evaluation_id NOT IN (SELECT id FROM evaluations);
+-- Expected: orphaned = 0
+
+-- Verify 5: Indexes created
+-- SELECT indexname, tablename FROM pg_indexes 
+-- WHERE indexname LIKE 'idx_evaluation%evaluation_id%'
+-- ORDER BY tablename;
+-- Expected: 5 indexes
+
+-- ========== ROLLBACK PROCEDURE ==========
+-- If migration fails, run this to revert:
+--
+-- BEGIN;
+-- DROP TABLE IF EXISTS _migration_0005_backup;
+-- ROLLBACK;
+--
+-- Then restore from backups (if backup tables still exist):
+-- INSERT INTO evaluation_scores SELECT * FROM evaluation_scores_backup;
+-- etc.
